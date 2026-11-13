@@ -1,0 +1,8 @@
+{
+  "name": "djbclark-ade",
+  "description": "Claude Code plugins from djbclark-ade (the agent toolchain repo).",
+  "owner": {
+    "name": "djbclark"
+  },
+  "plugins": []
+}

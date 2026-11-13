@@ -1,0 +1,37 @@
+# Open PRs conflicted with `master` (2026-11-10)
+
+Snapshot from `gh pr list --state open --limit 200` filtered to
+`mergeable=="CONFLICTING"` and `baseRefName=="master"`. Re-probe before acting;
+mergeability changes when `master` moves.
+
+Probe:
+
+```bash
+gh pr list --repo djbclark/djbclark-ade --state open --limit 200 \
+  --json number,title,mergeable,baseRefName \
+  --jq '.[]|select(.mergeable=="CONFLICTING" and .baseRefName=="master")|{n:.number,t:.title}'
+```
+
+## Inventory and guidance
+
+| PR | Branch | Draft | Title (short) | Suggested action |
+|----|--------|-------|---------------|------------------|
+| [290](https://github.com/djbclark/djbclark-ade/pull/290) | `claude/issue-278-checkpointing` | yes | `ade-recovery` plugin + `paseo-checkpoint` (issue 278) | **Park / supersede split:** full plugin stays parked per Carried #2 and PLAN J6/J9 until the native-resume trial (operator batch A6) lands. D1 measurement is **not** blocked on rebasing this branch — use [471](https://github.com/djbclark/djbclark-ade/pull/471) (`bin/ade-recovery-d1`, observe-only preflight, mergeable on `master`). After the trial: **close** #290 if Paseo native resume + tier-1 records suffice; **rebase** onto current `master`, refresh checks and the adversary marker, only if a gap remains. Do not merge both #290 and #471 for the same D1 scope. |
+| [270](https://github.com/djbclark/djbclark-ade/pull/270) | `quota-surplus` | yes | quota-surplus watchdog | **Close** per slim-down ledger (operator ruling: PR 270 closed); quota guard retired with the slim-down. |
+| [269](https://github.com/djbclark/djbclark-ade/pull/269) | `coding-bot-peer-link` | no | coding-bot over peer-link | **Superseded / closed:** slim E6/E9j moved `bin/coding-bot` to peer-link; tip would restore it here. Demanual landed as #523 (`cursor/coding-bot-peer-link-f576`); #269 closed. Do not rebase this tip. |
+| [256](https://github.com/djbclark/djbclark-ade/pull/256) | `open-clean-env` | no | `bin/open-clean` | **Ported:** tip's prefer-master rebase mangled `bash_habits_gate`/`dispatch-footer` (CI red). Fresh port on `cursor/open-clean-env-f576` (#522) from master. Close #256 once that PR merges. |
+| [231](https://github.com/djbclark/djbclark-ade/pull/231) | `mds-client-probe` | no | load-watch mds probe | **Superseded:** Wave 6 port is [517](https://github.com/djbclark/djbclark-ade/pull/517) (`cursor/mds-probe-wave6-f576`). Close #231 once #517 merges; do not rebase this tip. |
+| [227](https://github.com/djbclark/djbclark-ade/pull/227) | `bottom-config-uncapped-command` | no | bottom fork Command column doc | **Superseded:** skill moved to site-djbclark (slim E1 / #297); tip would re-add it here. Demanual + proposed site-djbclark patch: [bottom-config-uncapped-command-2026-11-10.md](bottom-config-uncapped-command-2026-11-10.md) (`cursor/bottom-config-uncapped-f576`). Close #227 once that hygiene PR merges; do not rebase this tip. |
+| [208](https://github.com/djbclark/djbclark-ade/pull/208) | `astra-readonly` | no | acp-run read-only advise slices | **Closed 2026-11-10:** tip `29a0d9e6` denial-continue / `cancelled_note` / `model_fallback` targeted pre–Wave 6 `acp-run`←`acp-dispatch`. Master routes Claude `--perm read-only|deny` through `bin/review-launch` (continues past denials); other agents BEST EFFORT via `paseo run`; LIVE_RE callers of acp-run = 0 (`#498`). Rebase would not close a live gap; Wave 6 delete still Carried #1. |
+| [194](https://github.com/djbclark/djbclark-ade/pull/194) | `finder-consent-agents-cleanup` | no | AGENTS.md lean rewrite | **Closed 2026-11-10:** tip @ 173f323a (329 lines, Orca/herdr drain prose + unrelated `tests/test_pr_wait.py`) superseded by slim E11 `AGENTS.md` on `master` (196 lines, Paseo-only). Further date-trim needs a fresh PR, not this tip. |
+
+## Related (not conflicting on this snapshot)
+
+- [471](https://github.com/djbclark/djbclark-ade/pull/471) — `cursor/ade-recovery-d1-f576`, base `master`, **MERGEABLE** at probe time: ships observe-only D1 preflight while #290 stays parked; prefer merging or closing #471 on its own merits before touching #290's branch.
+
+## Hygiene workflow
+
+1. Decide **close**, **rebase**, or **supersede** per row (default for retired shims: close).
+2. For a rebase: fresh worktree from `origin/master`, `git fetch origin <branch>`, rebase, push with lease, re-run `adversary-marker` and Tests.
+3. Update Carried #2 in `docs/queue.md` when #290 or #471 closes.
+4. Re-run the probe command above after bulk merges to refresh this list.

@@ -1,0 +1,44 @@
+---
+name: btww
+description: >-
+  Remind the user which native side-question command this TUI has (Claude
+  Code /btw, Codex /side, and so on), or say that it has none. Use for /btww,
+  "btww", "btw", "side question", "what is the btw command here". Reply only;
+  never answers the question itself.
+---
+
+# btww — which native side-question command does this TUI have?
+
+A real side question (Claude Code's `/btw`) runs in a fork: it answers while
+the main turn keeps streaming and stays out of the transcript. A skill cannot
+do that, because it is an ordinary turn. So `/btww` does not answer the
+question. It names the native command for the TUI you are running in.
+
+## Rules
+
+1. Identify your TUI from your own system prompt and harness (not by running a
+   command). Look it up in the table.
+2. Reply with **one or two lines, no tool calls**: the native command with
+   its usage, plus the user's own question quoted back so it can be pasted
+   (`/btw <question>`). If the TUI has none, say `No native side-question
+   command in <TUI>; ask it as a normal message.`
+3. Do not answer the question, edit anything, or change the task in progress.
+   If a task was running, carry on with it.
+4. Quote only your own TUI's row: its command spelling, alias and notes. Never borrow a note from another row (Codex's native command is `/side`, not `/btw`).
+5. TUI not in the table: say it is not covered and that no native side-question
+   command is known there.
+
+## Table (verified 2026-11-09; Pi-only third-party TUI, queue item 36)
+
+| TUI | Native command | Notes |
+|---|---|---|
+| Claude Code | `/btw <question>` | forked query, tools off |
+| Codex | `/side` | ephemeral side conversation in a temporary fork; needs a started thread; Ctrl+C returns to the main thread |
+| Cursor `cursor-agent` | `/btw <question>` | tools disabled |
+| Pi | none found | sole third-party TUI (2026-11-08); ask as a normal message |
+| Hermes | `/btw <question>` | CLI: `/btww <question>` is a `quick_commands` alias for it. Telegram and gateways: use `/btw` |
+| Grok Bot | none found | |
+
+**Archived (never fallbacks):** omp and OpenCode had `/btw` (omp also ran `/btww` via `omp/commands/btww.md`, `side: true`); those clients are archive-history only under the Pi-only ruling. The checked-in `omp/commands/btww.md` wrapper is historical.
+
+Canonical copy: `~/src/djbclark-ade/skills/btww/`. Hermes alias: `agents/hermes/config.yaml.tmpl`.

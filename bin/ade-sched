@@ -1,0 +1,355 @@
+#!/usr/bin/env -S python3 -I
+"""ade-sched: install a checked-in launchd plist on this machine's scheduler (launchd, systemd user units or cron).
+
+usage:
+  ade-sched [options] backend               the backend auto-detection picks, its unit/agent dir, the linger state
+  ade-sched [options] render PLIST          print what install would write (one `# <path>` header per artifact)
+  ade-sched [options] install PLIST         write and activate the job
+  ade-sched [options] uninstall LABEL       remove it (not installed: exit 0)
+  ade-sched [options] status [LABEL...]     installed / active / next run; no LABEL: every job ade-sched generated
+  ade-sched [options] list                  print install.jobs / install.retired_jobs from the install catalog
+  ade-sched [options] diff                  compare the catalog to live launchd/systemd/cron/paseo (report only)
+  ade-sched [options] reconcile             ADE-owned launchd/systemd/cron/paseo reconcile + ownership ledger (S4b; default dry-run)
+
+options (before or after the subcommand):
+  --backend auto|launchd|systemd|cron   default auto (env ADE_SCHED_BACKEND; `none` there turns scheduling off, exit 69)
+  --ade DIR             the checkout that fills __ADE__ / @ADE@ (default: the one this script is in; install refuses
+                        that default with exit 2 when it is a linked git worktree, which is deleted after its merge)
+  --root DIR            catalog root for list/diff/reconcile (default: checkout containing this script)
+  --set KEY=VALUE       fill a placeholder, literally as written in the plist (__STATE__=..., @TARGET@=...); repeatable
+  --dry-run             install/uninstall: print the artifacts and commands, change nothing;
+                        reconcile: plan only (default for reconcile when --yes is absent)
+  --yes                 reconcile: execute only admitted writes and write jobs.json; today that is launchd only (an absent-job create+bootstrap, or a bootstrap of an unloaded plist that byte-matches the render); a LOADED job is reloaded or removed only when its installed plist routes through bin/ade-job-run and is provably ADE's (W21c; a run in flight defers it); other loaded jobs, other files, removals that are not so, systemd/cron and paseo steps defer (exit 6)
+  --name NAME           reconcile: limit to these logical job names (repeatable)
+  --no-activate         install/uninstall/reconcile: write or remove the files, print the activation commands instead of running them
+  --restart-service     launchd install/uninstall of a LOADED job that is not canonical-wrapped: allowed ONLY for a KeepAlive service that does
+                        not run through bin/ade-job-run (the LOADED definition must itself show KeepAlive, and the installed file must be the
+                        loaded definition, at the loaded path, with a truthy KeepAlive: any truthy KeepAlive counts, conditional dicts
+                        included, ADE-owned or not; an install also needs the new definition's KeepAlive), as a deliberate service restart. The bootout STOPS the running service
+                        (not paid-work-safe); the prior bytes and a recovery record are saved first and the prior definition is loaded again if
+                        the new one fails (if that fails too the service stays down: the error prints the manual steps). Otherwise the job is
+                        refused (exit 1). No effect on a canonical-wrapped job, systemd or cron; --no-activate is refused (exit 2) only when it
+                        would restart; a busy admission lock still refuses
+  --allow-no-linger     systemd install/reconcile: proceed when loginctl says Linger=no (default: exit 69 before writing, because
+                        user timers stop at logout); never runs sudo, prints `sudo loginctl enable-linger USER`
+  --json                list/diff/reconcile: machine-readable output
+
+Auto-detection: darwin with launchctl -> launchd; a booted systemd whose `systemctl --user is-system-running` answers
+running/degraded/starting/initializing -> systemd; booted systemd with no reachable user manager -> exit 69 (never a
+silent cron); otherwise crontab on PATH -> cron. Placeholders __ADE__ and __HOME__ are always filled; any other
+__NAME__ or @NAME@ left unfilled is exit 2, and so is an EnvironmentVariables name that looks like a secret
+(KEY/TOKEN/SECRET/PASSWORD). A oneshot systemd job gets KillMode=process (setsid-detached children survive, as on
+launchd; plist key KillMode overrides), TimeoutStartSec=max(3 x StartInterval, 300s) and AccuracySec=1s. On systemd and
+cron, ~/.local/bin:/usr/local/bin:/usr/bin:/bin go first in PATH (plist PATHs are Mac paths).
+
+list/diff/reconcile read config/install.toml [install.jobs] / [install.retired_jobs] (S4b) and load the install catalog
+only then (so backend/install/status stay usable on Python 3.10 without tomllib). diff never unloads any job,
+including foreign owners (Orca/BB/herdr and unknown labels are reported only). reconcile writes ADE-owned
+ade-sched jobs on launchd, systemd user units, and user crontab (RECONCILE_WRITE_BACKENDS), creates/deletes
+ADE-owned paseo schedules (ledger backend=paseo), removes only labels recorded in the ownership ledger
+(~/.local/state/djbclark-ade/jobs.json or ADE_JOBS_STATE_DIR), and never unloads foreign/unknown owners or
+root/--system units. A Paseo probe timeout/launch error or a failed host-backend scan is reported as
+unknown, never as an empty job list.
+
+Overrides (env): ADE_SCHED_LAUNCHCTL, ADE_SCHED_SYSTEMCTL, ADE_SCHED_LOGINCTL, ADE_SCHED_CRONTAB (binaries);
+ADE_SCHED_LAUNCH_AGENTS (default ~/Library/LaunchAgents), ADE_SCHED_UNIT_DIR (default
+${XDG_CONFIG_HOME:-~/.config}/systemd/user), ADE_SCHED_LOCK (the crontab edit lock, default
+${XDG_STATE_HOME:-~/.local/state}/ade/ade-sched.lock); ADE_JOBS_STATE_DIR (ownership ledger dir, default
+~/.local/state/djbclark-ade).
+
+exit: 6 durable reconcile deferral (admission/drain/migration); 0 ok; 1 an activation command failed (its stderr is quoted) or diff found ADE drift or reconcile had a
+blocked/failed step; 2 bad job or usage (also: reconcile --yes on a non-write host backend with no paseo work); 3 status:
+a LABEL is not installed; 69 no usable scheduler (none forced, none found, systemd user manager unreachable, Linger=no
+on a systemd install without --allow-no-linger, KeepAlive or a StartInterval under 60 s on cron). A `crontab -l`
+failure other than "no crontab" is exit 1 and the crontab is left untouched.
+
+Notes and warnings (unmapped plist keys, cron rounding) go to stderr and do not change the exit status.
+docs/scheduling.md is the manual.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path[:0] = [d for d in (os.path.dirname(os.path.realpath(__file__)),) if d not in sys.path]   # python3 -I has no script dir
+import ade_sched
+
+# ade_install (and its tomllib via ade_config) is imported only inside list/diff/reconcile. Other
+# subcommands must stay usable on Python 3.10 hosts (Ubuntu 22.04) that lack tomllib.
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:   # argparse's own exit 2 is our usage code; keep the doc's usage text
+        print(__doc__.split("\n\n", 2)[1], file=sys.stderr)
+        print(f"ade-sched: {message}", file=sys.stderr)
+        raise SystemExit(ade_sched.EX_USAGE)
+
+
+def _common(p: argparse.ArgumentParser, top: bool) -> None:
+    """The options, on the top parser (with the defaults) and on every subcommand (SUPPRESS: set only when given there)."""
+    def dflt(v: object) -> dict[str, object]:
+        return {"default": v if top else argparse.SUPPRESS}
+    p.add_argument("--backend", choices=("auto", *ade_sched.BACKENDS), **dflt("auto"))
+    p.add_argument("--ade", metavar="DIR", **dflt(None))
+    p.add_argument("--root", metavar="DIR", **dflt(None))
+    # its own dest on a subcommand: an append there would REPLACE the top-level list, dropping earlier --set values
+    p.add_argument("--set", action="append", metavar="KEY=VALUE", dest="subst" if top else "sub_subst", **dflt([]))
+    p.add_argument("--dry-run", action="store_true", dest="dry_run" if top else "sub_dry_run", **dflt(False))
+    p.add_argument("--yes", action="store_true", dest="yes" if top else "sub_yes", **dflt(False))
+    p.add_argument("--name", action="append", metavar="NAME", dest="names" if top else "sub_names", **dflt([]))
+    p.add_argument("--no-activate", action="store_true", **dflt(False))
+    p.add_argument("--allow-no-linger", action="store_true", **dflt(False))
+    p.add_argument("--restart-service", action="store_true", **dflt(False))
+    p.add_argument("--json", action="store_true", **dflt(False))
+
+
+def parse(argv: list[str]) -> argparse.Namespace:
+    ap = _Parser(prog="ade-sched", description="install a launchd plist on launchd, systemd or cron",
+                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    _common(ap, top=True)
+    sub = ap.add_subparsers(dest="cmd", required=True, parser_class=_Parser)
+    for name, arg, nargs in (("backend", None, None), ("render", "plist", None), ("install", "plist", None), ("migrate-wrapper", "plist", None),
+                             ("uninstall", "label", None), ("status", "labels", "*"),
+                             ("list", None, None), ("diff", None, None), ("reconcile", None, None)):
+        sp = sub.add_parser(name)
+        _common(sp, top=False)
+        if arg:
+            sp.add_argument(arg, nargs=nargs) if nargs else sp.add_argument(arg)
+    a = ap.parse_args(argv)
+    if a.restart_service and a.cmd not in ("install", "uninstall"):   # W21d lows: a flag that stops a service is never silently ignored
+        ap.error(f"--restart-service applies only to install and uninstall, not {a.cmd}")
+    a.subst = [*a.subst, *getattr(a, "sub_subst", [])]   # --set before and after the subcommand both count
+    a.names = [*a.names, *getattr(a, "sub_names", [])]
+    if getattr(a, "sub_dry_run", False):
+        a.dry_run = True
+    if getattr(a, "sub_yes", False):
+        a.yes = True
+    return a
+
+
+def _subst(a: argparse.Namespace) -> dict[str, str]:
+    subst: dict[str, str] = {}   # __ADE__/__HOME__ come from Job.from_plist(ade=...), which knows whether --ade was given
+    for item in a.subst:
+        key, sep, val = item.partition("=")
+        if not sep or not key:
+            raise ade_sched.SchedError(ade_sched.EX_USAGE, f"--set wants KEY=VALUE, not {item!r}")
+        subst[key] = val
+    return subst
+
+
+def _catalog_root(a: argparse.Namespace) -> Path:
+    if a.root:
+        return Path(a.root)
+    if a.ade:
+        return Path(a.ade)
+    return Path(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+
+
+def _cmd_list(a: argparse.Namespace) -> int:
+    import ade_install as ai  # deferred: tomllib/3.11 only needed for catalog list/diff/reconcile
+
+    try:
+        catalog = ai.load_catalog(root=_catalog_root(a))
+    except ai.InstallError as e:
+        print(f"ade-sched: {e}", file=sys.stderr)
+        return ade_sched.EX_USAGE
+    if a.json:
+        json.dump(
+            {"jobs": catalog.jobs, "retired_jobs": catalog.retired_jobs},
+            sys.stdout,
+            indent=2,
+            sort_keys=True,
+        )
+        sys.stdout.write("\n")
+        return 0
+    lines = ade_sched.format_job_list(catalog.jobs, catalog.retired_jobs)
+    print(f"ade-sched list: {len(catalog.jobs)} jobs, {len(catalog.retired_jobs)} retired")
+    for line in lines:
+        print(line)
+    return 0
+
+
+def _cmd_diff(a: argparse.Namespace) -> int:
+    import ade_install as ai  # deferred: tomllib/3.11 only needed for catalog list/diff/reconcile
+
+    try:
+        catalog = ai.load_catalog(root=_catalog_root(a))
+    except ai.InstallError as e:
+        print(f"ade-sched: {e}", file=sys.stderr)
+        return ade_sched.EX_USAGE
+    backend = None if a.backend == "auto" else a.backend
+    live = ade_sched.scan_live(backend)
+    rows = ade_sched.diff_jobs(catalog.jobs, catalog.retired_jobs, live, unload=False)
+    failed = sum(1 for r in rows if r.fail)
+    if a.json:
+        json.dump(
+            {
+                "backend": live.backend,
+                "live": [{"id": j.id, "backend": j.backend, "source": j.source, "active": j.active}
+                         for j in live.jobs],
+                "notes": list(live.notes),
+                "drift": [
+                    {
+                        "name": r.name,
+                        "status": r.status,
+                        "owner": r.owner,
+                        "detail": r.detail,
+                        "category": r.category,
+                        "fail": r.fail,
+                        "action": r.action,
+                    }
+                    for r in rows
+                ],
+                "ok": failed == 0,
+            },
+            sys.stdout,
+            indent=2,
+            sort_keys=True,
+        )
+        sys.stdout.write("\n")
+    else:
+        print(
+            f"ade-sched diff: backend={live.backend} live={len(live.jobs)} "
+            f"drift_rows={len(rows)} (report only; never unload)"
+        )
+        for r in rows:
+            mark = "FAIL" if r.fail else r.status
+            print(f"  {mark:9} {r.category}/{r.name} owner={r.owner}: {r.detail}")
+    return 1 if failed else 0
+
+
+def _cmd_reconcile(a: argparse.Namespace) -> int:
+    import ade_install as ai  # deferred: tomllib/3.11 only needed for catalog list/diff/reconcile
+
+    if a.yes and a.dry_run:
+        print("ade-sched reconcile: refuse both --yes and --dry-run", file=sys.stderr)
+        return ade_sched.EX_USAGE
+    dry_run = not a.yes  # default dry-run; --yes executes
+    try:
+        catalog = ai.load_catalog(root=_catalog_root(a))
+    except ai.InstallError as e:
+        print(f"ade-sched: {e}", file=sys.stderr)
+        return ade_sched.EX_USAGE
+    backend = None if a.backend == "auto" else a.backend
+    names = set(a.names) if a.names else None
+    results, rc = ade_sched.reconcile(
+        catalog.jobs,
+        catalog.retired_jobs,
+        dry_run=dry_run,
+        backend=backend,
+        root=_catalog_root(a),
+        ade=a.ade,
+        names=names,
+        allow_no_linger=a.allow_no_linger,
+        activate=not a.no_activate,
+        extra_subst=_subst(a),
+        native_admission=True,
+    )
+    mode = "dry-run" if dry_run else "yes"
+    ledger_path = str(ade_sched.jobs_ledger_path())
+    if a.json:
+        json.dump(
+            {
+                "ok": rc == 0,
+                "mode": mode,
+                "ledger": ledger_path,
+                "write_backend": ade_sched.RECONCILE_WRITE_BACKEND,
+                "write_backends": sorted(ade_sched.RECONCILE_WRITE_BACKENDS),
+                "results": results,
+            },
+            sys.stdout,
+            indent=2,
+            sort_keys=True,
+        )
+        sys.stdout.write("\n")
+    else:
+        label = "OK" if rc == 0 else "FAIL"
+        backends = "/".join(sorted(ade_sched.RECONCILE_WRITE_BACKENDS))
+        print(
+            f"ade-sched reconcile ({mode}): {label} "
+            f"({backends} write path; never unload foreign; ledger={ledger_path})"
+        )
+        for row in results:
+            print(
+                f"  {row.get('action', '?'):16} {row.get('category', 'job')}/{row.get('name')} "
+                f"owner={row.get('owner')}: {row.get('detail')}"
+            )
+    return rc
+
+
+def main(argv: list[str] | None = None) -> int:
+    a = parse(sys.argv[1:] if argv is None else argv)
+    if a.ade and not os.path.isdir(a.ade):
+        print(f"ade-sched: --ade {a.ade} is not a directory", file=sys.stderr)
+        return ade_sched.EX_USAGE
+    if a.root and not os.path.isdir(a.root):
+        print(f"ade-sched: --root {a.root} is not a directory", file=sys.stderr)
+        return ade_sched.EX_USAGE
+    backend = None if a.backend == "auto" else a.backend
+    try:
+        if a.cmd == "list":
+            return _cmd_list(a)
+        if a.cmd == "diff":
+            return _cmd_diff(a)
+        if a.cmd == "reconcile":
+            return _cmd_reconcile(a)
+        if a.cmd == "backend":
+            b = ade_sched.detect(backend)
+            print(f"backend: {b.name} ({b.reason})")
+            if b.name == "launchd":
+                print(f"agents: {ade_sched.launch_agents_dir(b.env)}")
+            elif b.name == "systemd":
+                print(f"units: {ade_sched.unit_dir(b.env)}")
+                print(f"linger: {ade_sched.linger(b.env) or 'unknown'}")
+            else:
+                print(f"crontab: {ade_sched.tool('crontab', b.env)}")
+            return 0
+        if a.cmd in ("render", "install"):
+            job = ade_sched.Job.from_plist(a.plist, _subst(a), ade=a.ade)
+            if a.cmd == "render":
+                r = ade_sched.render(job, ade_sched.detect(backend))
+                for n in r.notes:
+                    print(f"ade-sched: note: {n}", file=sys.stderr)
+                ade_sched.print_artifacts(r, sys.stdout)
+                return 0
+            r = ade_sched.install(job, backend, dry_run=a.dry_run, activate=not a.no_activate,
+                                  allow_no_linger=a.allow_no_linger, restart_service=a.restart_service)
+            if not a.dry_run:
+                print(f"ade-sched: installed {job.label} on {r.backend}", file=sys.stderr)
+            return 0
+        if a.cmd == "migrate-wrapper":
+            job = ade_sched.Job.from_plist(a.plist, _subst(a), ade=a.ade)
+            r = ade_sched.render(job, ade_sched.detect(backend))
+            if r.backend != "launchd":
+                raise ade_sched.SchedError(ade_sched.EX_USAGE, "migrate-wrapper is for launchd jobs")
+            if a.dry_run:
+                print(f"# migrate {job.label}: refuse unless idle, then bootout, write, bootstrap under the canonical lock", file=sys.stderr)
+                return 0
+            print(f"ade-sched: {ade_sched.migrate_wrapper_launchd(job, next(iter(r.files.values())))} {job.label}", file=sys.stderr)
+            return 0
+        if a.cmd == "uninstall":
+            found = ade_sched.uninstall(a.label, backend, dry_run=a.dry_run, activate=not a.no_activate, ade=a.ade,
+                                       restart_service=a.restart_service)
+            if not a.dry_run:
+                print(f"ade-sched: {'removed' if found else 'not installed:'} {a.label}", file=sys.stderr)
+            return 0
+        b = ade_sched.detect(backend)
+        labels = a.labels or ade_sched.installed_labels(b)
+        missing = 0
+        for label in labels:
+            s = ade_sched.status(label, b)
+            missing += not s.installed
+            act = "unknown" if s.active is None else "active" if s.active else "inactive"
+            print(f"{label}\t{s.backend}\t{'installed' if s.installed else 'not-installed'}\t{act}\t"
+                  f"next={s.next_run or '-'}")
+        return ade_sched.EX_NOT_INSTALLED if missing and a.labels else 0
+    except ade_sched.SchedError as e:
+        print(f"ade-sched: {e}", file=sys.stderr)
+        return e.code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,411 @@
+"""claude/hooks/bash_habits_gate.py: bare sed, a GNU-only option on a bare BSD tool and a filter's
+status read as the command's are denied; `sudo -n` without `-k` gets a warning. Cases are the
+2026-10-18 slips plus the forms this machine's agents use every day, which must keep passing."""
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+HOOK = Path(__file__).resolve().parent.parent / "claude" / "hooks" / "bash_habits_gate.py"
+
+
+def run(command, tool="Bash", env=None):
+    r = subprocess.run([sys.executable, str(HOOK)],
+                       input=json.dumps({"tool_name": tool, "tool_input": {"command": command}}),
+                       capture_output=True, text=True, timeout=30, env=env)
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout)["hookSpecificOutput"] if r.stdout.strip() else None
+
+
+def denied(command):
+    out = run(command)
+    return bool(out) and out.get("permissionDecision") == "deny"
+
+
+@pytest.mark.parametrize("command", [
+    "sed -n 2134,2138p bin/acp-dispatch",                                   # 2026-10-18 slip 1
+    "head -30 f.py; sed -n 1,20p f.py | gsed -n 1,20p >/dev/null",          # slip 2
+    "rg -l x . | xargs sed -i 's/a/b/'",
+    "FOO=1 sed -e s/a/b/ f",
+    "cd /tmp && sudo sed -i '' f",
+    "x=$(sed -n 1p f)",
+])
+def test_bare_sed_is_denied(command):
+    assert denied(command)
+
+
+@pytest.mark.parametrize("mode", ["--claude", "--codex", "--cursor"])
+@pytest.mark.parametrize("command", ["echo earlier; sed -n 1p f", "echo earlier && grep -r x ."])
+def test_denial_says_nothing_ran_and_whole_command_needs_rerun(mode, command):
+    payload = ({"command": command} if mode == "--cursor" else
+               {"tool_name": "Bash", "tool_input": {"command": command}})
+    result = subprocess.run([sys.executable, str(HOOK), mode], input=json.dumps(payload),
+                            capture_output=True, text=True, timeout=30)
+    if mode == "--codex":
+        assert result.returncode == 2
+        message = result.stderr
+    else:
+        assert result.returncode == 0
+        output = json.loads(result.stdout)
+        if mode == "--cursor":
+            assert output["permission"] == "deny"
+            message = output["agent_message"]
+            assert output["user_message"] == message
+        else:
+            assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+            message = output["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "NOTHING in this command ran" in message
+    assert "no earlier part executed" in message
+    assert "re-run the whole command" in message
+
+
+@pytest.mark.parametrize("command", [
+    "gsed -n 1,20p f",
+    "/usr/bin/sed -n 1p f",                                # a deliberate BSD call
+    "echo 'use sed here' && rg sed docs/",                 # words in quotes or as arguments
+    "git commit -m \"sed is BSD\" -- f",
+    "cat <<'EOF' > f\nsed -n 1p x\nEOF",                   # heredoc body
+    "ls  # sed later",
+])
+def test_sed_mentions_and_gsed_pass(command):
+    assert not denied(command)
+
+
+@pytest.mark.parametrize("command", [
+    # the 2026-10-18 slip: the refused merge's status was tail's, so push ran
+    "git merge --ff-only b 2>&1 | tail -2 && git push -q origin master",
+    "make 2>&1 | tail -5 || echo failed",
+    "pytest -q | tail -3; echo \"rc=$?\"",
+    "cmd | head -1\necho rc=$?",
+    "x=$(git log | head -1) && echo $x",
+    "cmd |& tee log && next",
+])
+def test_filter_status_read_as_the_commands_is_denied(command):
+    assert denied(command)
+
+
+@pytest.mark.parametrize("command", [
+    "cmd > out.log 2>&1; echo \"rc=$?\" > out.rc; tail -5 out.log",   # the documented form
+    "git rebase master 2>&1 | tail -5; git status --short",           # status not read
+    "launchctl list | rg -q label && echo loaded",                    # rg's status is the point
+    "ps ax | grep -q foo || start foo",
+    "set -o pipefail; make 2>&1 | tail -5 && echo ok",
+    "make | tail -3; echo ${PIPESTATUS[0]}",
+    "a && b | tail -2",                                               # nothing reads tail's
+    "cmd 2>&1 | tail -3",
+    "echo 'x | tail && y'",
+])
+def test_status_safe_pipelines_pass(command):
+    assert not denied(command)
+
+
+def test_sudo_n_without_k_is_warned_not_denied():
+    out = run("sudo -n /usr/bin/pmset -g")
+    assert out and "permissionDecision" not in out and "sudo -k -n" in out["additionalContext"]
+
+
+@pytest.mark.parametrize("command", ["sudo -k -n /usr/bin/true", "sudo -kn true", "sudo ls"])
+def test_sudo_k_n_and_plain_sudo_are_quiet(command):
+    assert run(command) is None
+
+
+@pytest.mark.parametrize("command", [
+    'chmod --reference="$F" "$T"; mv -f "$T" "$F"',                  # the 2026-10-18 slip
+    "chown --reference=a b",
+    "sudo chmod --reference=a b",
+    "cp --parents a/b dest/",
+    "cp --reflink=auto a b",
+    "FOO=1 cp --archive a b",
+    "mv --no-clobber a b",
+    "rm --recursive --force d",
+    "mkdir --parents x/y",
+    "touch --reference=a b",
+    "ln --symbolic --force a b",
+    "ls --group-directories-first",
+    "ls --almost-all -l",
+    "ls -la --human-readable",
+    "date -d yesterday +%F",
+    "x=$(date --date='2 days ago' +%F)",
+    "x=$(echo a,b | cut --delimiter=, -f1) && echo $x",     # inside the group still denied
+    "gh api x $(echo a | cut --delimiter=, -f1):y --jq .z",
+    "date -ud @0",
+    "stat -c %a f",
+    "stat --format=%a f",
+    "stat -Lc %a f",
+    "readlink -m a/b",
+    "readlink --canonicalize l",
+    "realpath --relative-to=. a",
+    "realpath -s a",
+    "wc --lines f",
+    "cut --delimiter=, -f1 f",
+    "tr --delete a",
+    "du --max-depth=1 .",
+    "du -sb .",
+    "df --human-readable",
+    "df --output=source",
+    "head -n -1 f",
+    "head --lines=-2 f",
+    "tail --follow=name f",
+    "tail --pid=1 -f f",
+    "head --quiet a b",
+    "grep -oP 'a\\Kb' f",
+    "grep --perl-regexp x f",
+    "git log | grep -P x",
+    "find . -printf '%p\\n'",
+    "find . -name x -regextype posix-extended",
+    "find . -executable -type f",
+    "find . -perm /111",
+    "cmd | xargs -0 cp --parents -t d",
+    "ls | xargs -n1 chmod --reference=a",
+    "ls | xargs -d '\\n' rm",
+    "ls | xargs -n 1 -d x rm",
+    "xargs --delimiter=, echo",
+    "cp -t d a",
+    "ln -r -s a b",
+    "xargs -i echo {}",
+])
+def test_gnu_only_option_on_a_bare_bsd_tool_is_denied(command):
+    assert denied(command)
+
+
+@pytest.mark.parametrize("command", [
+    "grep -rl -i 'globalprotect\\|openconnect\\|gpclient' /Users/djbclark/src /Users/djbclark/ops",
+    "grep -r pat .",
+    "grep -R pat dir",
+    "grep -ril pat src",
+    "ggrep -r pat dir",
+    "/usr/bin/grep -rl pat ~/src",
+])
+def test_recursive_grep_is_denied(command):
+    out = run(command)
+    assert out["permissionDecision"] == "deny"
+    assert "rg -n -l" in out["permissionDecisionReason"]
+    assert "plocate" in out["permissionDecisionReason"]
+
+
+def test_gnu_deny_reason_names_the_g_tool():
+    out = run('chmod --reference="$F" "$T"; mv -f "$T" "$F"')
+    assert "gchmod" in out["permissionDecisionReason"] and "--reference" in out["permissionDecisionReason"]
+    assert "gdate" in run("date -d yesterday")["permissionDecisionReason"]
+    assert "xargs gcp" in run("ls | xargs cp --parents -t d")["permissionDecisionReason"]
+    assert "gxargs" in run("ls | xargs -d x rm")["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize("command", [
+    "gchmod --reference=a b",
+    "gcp --parents a b; gls --group-directories-first; gdate -d yesterday; gstat -c %a f",
+    "/bin/chmod -R 755 d",
+    "/bin/cp --parents a b",                                 # explicit path: a deliberate call
+    "ggrep -P x f; gfind . -printf x; gxargs -d x rm",
+    "chmod --help; date --version",                          # usage probes
+    "chmod 755 f; chmod -R u+x d; chown -R me d",
+    "cp -R a b; cp -p a b; mv -f a b; rm -rf d; mkdir -p x/y; ln -sf a b; touch -d 2020-01-01 f",
+    "ls -la; ls --color=auto; ls --color",
+    "date -u +%s; date -I; date -v+1d +%F; date -r 0",
+    "stat -f %Lp f; stat -L f",
+    "readlink -f l; readlink l; realpath a; realpath -q a",
+    "head -n 5 f; head --lines=5 f; tail -n +2 f; tail --lines=5 f; tail -F f; tail -f f",
+    "wc -l f; cut -d, -f1 f; tr -d a; du -sh .; du -d1 .; df -h",
+    "sort --version-sort f; sort --reverse --unique f",
+    "xargs -0 -n1 echo; xargs -r rm; xargs -P4 -I{} echo {}; xargs --null --max-args=1 echo",
+    "find . -maxdepth 1 -name x -delete; find . -perm +111; find . -newermt 2020-01-01",
+    "find . -exec grep --perl-regexp x {} +",                # after -exec it is not find's
+    "grep -E x f; grep --color=auto -i x f; grep -e P f; ps aux | grep ssh",
+    "echo 'chmod --reference=a b' && echo \"cp --parents\"",     # quoted text
+    "cat <<'EOF' > f\nchmod --reference=a b\nEOF",                # heredoc body
+    "ls  # cp --parents a b",                                # comment
+    "ssh host 'cp --parents a b'",
+    "ssh host cp --parents a b",                             # remote Linux: not this Mac's cp
+    "docker run img cp --parents a b",
+    "git log --format=%H --reverse; git diff --stat",
+    "cp a b --force",                                        # past the operands BSD reads no options
+    "rm -rf -- --weird",
+    # text after the `)` of a $(... | tool ...) group belongs to the outer command (2026-11-02)
+    "gh api repos/o/r/compare/m...$(echo $r|cut -d/ -f1):master --jq .x",
+    "git log $(git rev-parse HEAD | cut -c1-7)..HEAD --format=%H",
+    "echo $(echo a | tr -d a) --version-sort",
+    # a filter that ends a substitution is not the status `&&` reads (Codex review of PR 254)
+    "echo $(printf x | cat) && echo done",
+    "cat <(printf x | cat) && echo done",
+    # a regex or extended-glob group is not a substitution: nothing after its `)` is trimmed (Codex review of PR 254, round 3)
+    "[[ $tool =~ ^(awk|sed)$ ]] && echo recognized",
+    "ls @(awk|sed)",
+    # the substitution opens in one pipeline and closes in another
+    "gh api x $(echo $r && echo a | cut -d/ -f1):master --jq .y",
+    # an escaped `$` is not a substitution opener (Codex review of PR 254, round 4)
+    "[[ $tool =~ \\$(awk|sed) ]] && echo recognized",
+    # nested substitutions: each body is its own command, the outer keeps the text after the `)`
+    "gh api x $(echo $(echo a | cut -d/ -f1) | cut -d/ -f1):master --jq .y",
+    # an arithmetic expansion runs no command (Codex review of PR 254, round 5)
+    "sed=2; echo $((sed + 1))",
+    "echo $((stat -c))",
+    "echo $(( (1 + 2) * 3 )) | cut -d/ -f1",
+    "sed=2; echo $((1<(sed)))",
+    # Escaped inner backticks execute only portable commands.
+    r"x=$((`echo \`printf 1 | gsed -n 1p\`` + 1))",
+    r"x=$((`echo \`printf 1\`` + 1))",
+])
+def test_gnu_flags_that_work_or_do_not_apply_pass(command):
+    assert not denied(command)
+
+
+@pytest.mark.parametrize("command", [
+    # an escaped paren is argument content, not a subshell close, so the GNU option after it counts
+    "echo x | cut -d\\) --complement -f1",
+    "find . -name foo\\) -printf '%p\\n'",
+    # a plain `(a | tail)` group still hands tail's status to `&&`
+    "(git merge --ff-only x | tail -2) && git push",
+    # the status check reads the whole outer pipeline, trimmed or not (Codex review of PR 254)
+    "git merge --ff-only topic | tee $(printf /tmp/merge.log | cat -) && git push",
+    "(x=$(false | tail -2)) && printf PUSHED",
+    # an escaped paren after a regex group, and a plain pipe after a closed substitution, stay checked
+    "echo x | grep -E '^(a|b)' | cut -d\\) --complement -f1",
+    "x=$(echo a | cut -d, -f1) && ls | cut --complement -f1",
+    # the outer command keeps its own options when a substitution sits among its arguments (Codex review of PR 254, round 4)
+    "cut -d$(printf , | cut -c1) --complement -f1 f",
+    "diff <(sort a | head -1) <(ls) --brief --ignore-matching-lines=x; stat --format=%a $(ls | head -1) f",
+    # a GNU option inside any substitution body is denied, lone or nested
+    "git log --since=$(date -d yesterday +%F)",
+    "echo $(echo $(echo a | cut --complement -f1) | cut -d/ -f1)",
+    "echo $(( $(date -d x +%s) + 1 ))",
+    "x=$((`date -d yesterday +%s` + 1))",
+    "x=$((sed -n 1p f); printf x)",
+    # Escaped backticks belong to a nested command, not to the outer pair.
+    r"x=$((`echo \`printf 1 | sed -n 1p\`` + 1))",
+    r"x=$((`echo \`printf 1 | cut --complement -f1\`` + 1))",
+    r"x=$((`echo \`date -d yesterday +%s\`` + 1))",
+])
+def test_escaped_parens_and_subshell_groups_stay_checked(command):
+    assert denied(command)
+
+
+def test_other_tools_and_the_off_switch_pass():
+    assert run("sed -n 1p f", tool="Grep") is None
+    assert run("sed -n 1p f", env=dict(os.environ, BASH_HABITS_GATE_OFF="1")) is None
+    assert run("chmod --reference=a b", env=dict(os.environ, BASH_HABITS_GATE_OFF="1")) is None
+
+
+def raw(payload, *args):
+    return subprocess.run([sys.executable, str(HOOK), *args], input=json.dumps(payload),
+                          capture_output=True, text=True, timeout=30)
+
+
+@pytest.mark.parametrize("command", [
+    # the real 2026-10-24 slip: a long peer message written via heredoc arrived cut off
+    # mid-sentence (632 bytes of 3178) because the delimiter was never reached — bash wrote the
+    # partial body, warned on stderr and exited 0, so nothing reported an error.
+    "cat > /tmp/msg.md <<'EOF'\nline one\nline two, no delimiter ever\n",
+    "cat <<EOF\ntext\n",
+    "cat <<'A'\none\nA\ncat <<'B'\ntwo\n",                      # the SECOND one is unclosed
+    "peer_mail.py send --text \"$(cat <<'EOF'\nbody\n)\"",      # unclosed inside a substitution
+])
+def test_unterminated_heredoc_is_denied(command):
+    assert denied(command)
+
+
+@pytest.mark.parametrize("command", [
+    "cat > f <<'EOF'\nhello\nEOF\n",
+    "cat > f <<EOF\nhello\nEOF\n",
+    "cat > f <<'EOF'\nDanny's rule (really)\nEOF\n",            # apostrophes are fine when closed
+    "cat <<'A'\none\nA\ncat <<'B'\ntwo\nB\n",                   # two, both closed
+    "cat <<-'EOF'\n\tbody\n\tEOF\n",                            # tab-indented terminator
+    "cat <<'EOF' | wc -l\nhello\nEOF\n",                        # in a pipeline
+    "cat <<'EOF'\nsay EOF now\nEOF\n",                          # delimiter word inside the body
+    "echo a \\<\\< b\n",                                        # an escaped << is a literal
+    "rg -n '<<EOF' docs/\n",                                    # inside a quoted string
+    "rg -n \"<<'EOF'\" docs/\n",
+    "rg -n pattern /tmp/file\n",                                # no heredoc at all
+])
+def test_closed_or_non_heredocs_pass(command):
+    assert not denied(command)
+
+
+@pytest.mark.parametrize("command", [
+    "open -a Quicksilver",                                  # the 2026-11-02 leak
+    "open https://example.com",
+    "/usr/bin/open -a 'Default Folder X'",
+    "cd /tmp && open .",
+    "make; open -R f",
+    "echo go | open -f",
+    "FOO=1 open x",
+    "env FOO=1 open x",
+    "env -u HOME open x",                                   # env without -i still leaks
+    "sudo open x",
+    "time open x",
+    "nohup open -a Ghostty &",
+    "ls | xargs open",
+    "printf '%s\\n' https://example.com | xargs -n 1 open",  # Codex P2 on #522
+    "ls | xargs -n1 open",
+    "ls | xargs --max-args=1 open",
+    "ls | xargs --max-args 1 open",
+    "timeout 5 open x",
+    "x=$(open -g y)",
+    "(open x)",
+])
+def test_bare_open_is_denied(command):
+    out = run(command)
+    assert out and out.get("permissionDecision") == "deny"
+    assert "bin/open-clean" in out["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize("command", [
+    "~/src/djbclark-ade/bin/open-clean -a Quicksilver",
+    "open-clean https://example.com",
+    "env -i HOME=$HOME PATH=/usr/bin /usr/bin/open -a X",   # a scrubbed environment
+    "env -i open x",
+    "env --ignore-environment open x",
+    "sudo env -i open x",
+    "xdg-open https://example.com",
+    "opencode run x",
+    "openssl x509 -in c.pem",
+    "cat open; ls open",                                    # a file named open
+    "rg -n open src/",
+    "git open",
+    "echo 'open -a X' > note.txt",                          # inside quotes
+    "echo \"open x\"",
+    "cat <<'EOF' > f\nopen -a X\nEOF",                      # heredoc body
+    "ls  # open x later",
+    "./open x",
+    "man open",
+])
+def test_clean_launches_and_other_open_words_pass(command):
+    assert not denied(command)
+
+
+def test_unterminated_heredoc_reason_names_the_consequence():
+    """The reason must say bash does not fail, because that is the surprising part."""
+    out = run("cat > /tmp/msg.md <<'EOF'\nno terminator\n")
+    reason = out.get("permissionDecisionReason", "")
+    assert "Unterminated heredoc" in reason
+    assert "exits 0" in reason or "partial" in reason.lower()
+
+
+def test_codex_mode_denies_with_exit_2_and_the_reason_on_stderr():
+    r = raw({"tool_name": "Bash", "tool_input": {"command": "sed -n 1p f"}}, "--codex")
+    assert r.returncode == 2 and "gsed" in r.stderr and r.stdout == ""
+    r = raw({"tool_name": "Bash", "tool_input": {"command": ["bash", "-lc", "x | tail && y"]}},
+            "--codex")
+    assert r.returncode == 2
+    assert raw({"tool_name": "Bash", "tool_input": {"command": "gsed -n 1p f"}},
+               "--codex").returncode == 0
+    r = raw({"tool_name": "Bash", "tool_input": {"command": "chmod --reference=a b"}}, "--codex")
+    assert r.returncode == 2 and "gchmod" in r.stderr
+
+
+def test_cursor_mode_answers_permission():
+    out = json.loads(raw({"command": "sed -n 1p f", "cwd": "/tmp"}, "--cursor").stdout)
+    assert out["permission"] == "deny" and "gsed" in out["agent_message"]
+    assert json.loads(raw({"command": "ls"}, "--cursor").stdout) == {"permission": "allow"}
+    out = json.loads(raw({"command": "cp --parents a b"}, "--cursor").stdout)
+    assert out["permission"] == "deny" and "gcp" in out["agent_message"]
+    warn = json.loads(raw({"command": "sudo -n true"}, "--cursor").stdout)
+    assert warn["permission"] == "allow" and "sudo -k -n" in warn["agent_message"]
+
+
+def test_garbage_input_fails_open():
+    r = subprocess.run([sys.executable, str(HOOK)], input="not json", capture_output=True,
+                       text=True, timeout=30)
+    assert (r.returncode, r.stdout) == (0, "")

@@ -1,0 +1,2579 @@
+#!/usr/bin/env python3
+"""load-watch: find the agent behind a sustained load spike, tell it, and steer that work to CI (free GitHub runners; Forgejo/Hyades for MIT/SIPB work). No model.
+
+    load-watch sample [--dry-run] [-v]      one sample (launchd runs this every 20 s); also watches compressor churn
+    load-watch status                       streak, top consumers in the window, cooldowns
+    load-watch incidents [-n N]             the incident ledger, newest last
+    load-watch ack ID "what you did"        the agent's answer to a brief (recorded in the ledger)
+    load-watch ci list|check DIR|rm DIR       the CI-first decisions `bg` reads
+    load-watch ci decide DIR ci "CI CMD"|local "why"|pending "note"
+    load-watch ci record DIR --job NAME --platform macos|linux|other --attempt ID --result failure|cancelled|success|slow
+    load-watch ci route DIR --job NAME --platform macos|linux|other [--slow]
+                                             TSV route (ci|local|wait), load gate (16|bypass|-), failures; exit 0
+    load-watch ci-only list|add DIR "CMD"|rm DIR|check DIR   (older form of `ci`, kept for scripts)
+    load-watch guard status|list|add LABEL [KEY=VALUE...] [--note N]|rm LABEL|reset LABEL
+    load-watch admit [--max-per-core N] [--max-mem-churn N] [--min-free-mb N] [--max-pageins N] [--max-agents [N]] [--no-reserve]
+    load-watch renew RESERVATION             extend an agent reservation by LW_RESERVE_S from now (a dispatcher still waiting)
+    load-watch release RESERVATION           shorten an agent reservation `admit --max-agents --json` printed (its agent is spawned)
+                     [--boost-per-core N] [--boost-max-churn N] [--wait SECONDS [--no-deadline]] [--json]
+                                            may new work START now? exit 0 yes, 75 still too hot, 2 usage
+    load-watch watcher set [--paseo ID] [--name N] [--chain C]|show [--json]|clear [T]|test [TEXT]
+                                            the one Paseo agent told about every spike
+    load-watch install|uninstall [--backend auto|launchd|systemd|cron] [--ade DIR] [--dry-run] [--allow-no-linger]
+                                            the 20 s sampler job, written from launchd/com.djbclark.load-watch.plist by bin/ade_sched.py
+                                            (launchd on the Mac, a systemd user timer on Linux; docs/scheduling.md). cron cannot run
+                                            every 20 s: exit 69, use systemd. Exit 69 also: no scheduler, or Linger=no without
+                                            --allow-no-linger. --ade is needed from a linked worktree (exit 2 otherwise).
+                                            The job runs through bin/ade-job-run (W21d): a LOADED install made before that is migrated once with
+                                            `ade-sched migrate-wrapper launchd/com.djbclark.load-watch.plist --ade DIR`; install/uninstall refuse it (exit 1) until then.
+                                            `guard reset` is macOS only (exit 69 without launchctl); the sampler never needs it.
+
+Why (2026-10-18): agents keep starting heavy builds and tests on this 8-core Mac (load 24-41 that
+morning; 180 on 2026-10-13, 300-400 on 2026-10-04). `bg`, site-djbclark's `heavy-shim` and the Claude test hook throttle
+what goes through them; nothing noticed what did not, or told the agent that started it. Plektra and
+stayturgid-agent already build only on CI (free GitHub runners since 2026-10-18, `ci/base` + `ci/run/**`; `forgejo-ci` skill); this finds the next
+candidate.
+
+Each sample is one `ps` call and `os.getloadavg()`: no model, no network. A sample counts as hot when
+the 1-minute load per core is at least LW_LOAD_PER_CORE (4.0; was 2.0 until 2026-11-01, when djbclark called 3.5 per core "not too bad for this system": on this 16 GB, 8-core Mac the real limit is memory pressure and process churn, not the load average). After LW_SUSTAIN_S (300) seconds of
+continuously hot samples it attributes the mean CPU of the samples in that window to Paseo agents (`paseo ls -g
+--background --json`, slim-down E5, 2026-11-06; it carries no pid and no session id, so the join is by working directory: a process
+belongs to the one agent whose cwd equals its own cwd or its nearest ancestor's (`/proc/PID/cwd` on Linux, `lsof` on
+macOS), else to the one agent in its cwd's git repo, such as a Gradle daemon's). Several agents on that cwd or repo is never
+guessed: the process lines and the candidate agents go to the operator notice (Hermes every LW_COOLDOWN_H per cwd, the
+watcher hourly). The walk up a process's ancestors stops at the first agent CLI (AGENT_CLIS and the listed providers), so
+work is never pinned on a daemon or shell above the agent; a process that joins no agent and uses LW_MIN_CORES or more
+goes to the operator with its process line, even when another agent was told in the same sample. No `paseo`, a failed
+`paseo ls` or an attribution crash is an operator notice too ("could not name the agent"), never an exception that stops
+the sampler. For each agent above LW_MIN_CORES (1.5) cores it writes a brief,
+sends the agent one line naming it (`paseo send --no-wait --json --behavior steer`, its `.status` read, never the exit
+code: `sent` is delivered, `queued` is logged "queued, not delivered"), and sends one hermes-ping (with a ready
+`paseo run --provider cursor/default …` line for a fixer unless the line was `sent`). An agent or repo is not told again
+for LW_COOLDOWN_H (6) hours (by agent, and by the repos its processes worked in). The brief names the
+work's own repo, not the agent's cwd (2026-10-18, `work_repos`): each top process's cwd, else its nearest
+ancestor's (brew and cargo children run in temp dirs), mapped to a git top-level, with that repo's `ci` decision,
+its Forgejo remote and whether an ancestor was `bg` (and which exception let it through: release or targeted
+test). Several repos are listed with their share of the cores; with none mapped it falls back to the agent's
+cwd and says that is a guess. That lsof/ancestor work runs only when a brief is written, never per sample.
+The agent is asked to finish what is running (never to kill paid-for
+work), ask djbclark before creating a CI copy of a repo that is not on GitHub, and, once CI runs, `load-watch ci-only add`
+the repo so `bg` refuses local builds and tests in it.
+
+Job guard (2026-10-18): each sample also checks launchd jobs (see the `job guard` section): a crash loop in
+any non-Apple job (20 failed restarts in 10 min, or 60 in 2 h), and hangs, CPU, memory or run time in the jobs listed in ~/.config/load-watch/guard.tsv.
+A trip boots the job out, kills its processes, pings Hermes and cools it down 90 min, then re-tests it; a
+5th round in 24 h disables it for good (`load-watch guard reset LABEL` brings it back). Events: guard.jsonl.
+The guard is the ONE deliberate exception to ade-sched's admission lock and no-kill contract (docs/scheduling.md, W21d).
+
+Load watcher (djbclark, 2026-10-20): `watcher set` registers one Paseo agent (`--paseo ID`, default $PASEO_AGENT_ID),
+reached by `paseo send`. Every incident, every sustained load no agent explains or several could, and every guard trip
+is also sent to it, with one paragraph saying what to do (WATCHER_HOWTO, which replaced the load watcher's role skill on 2026-11-06),
+so an agent with a model investigates. One record (watcher.json): `set` replaces the last watcher and tells it so. A
+record from before 2026-11-06 with the relay channel reaches nobody: `watcher show` says so (exit 1); re-register. A
+send that is not `sent` is stamped `last_fail`, never fatal (2026-10-23: a send that fails with the exact code
+DAEMON_UNREACHABLE, DAEMON_CONNECTION_LOST, DAEMON_NOT_READY or DAEMON_NOT_RUNNING, a daemon restart, is retried twice,
+5 s apart, inside 30 s, and once one send has given up the rest of that process make one attempt each; any other
+failure gets one attempt); the watcher is skipped for an incident only when it is the blamed agent and the line was `sent`.
+Unexplained sustained load reaches the watcher at most hourly (WATCHER_NOCPU_S), Hermes every LW_COOLDOWN_H.
+
+Compressor churn (2026-10-23, djbclark's memory-thrash follow-up): `admit` only refuses to START work while the
+compressor thrashes; running work and anything that skips `bg` / the agent dispatcher stayed invisible. Each sample
+therefore reads macOS `vm_stat` Compressions + Decompressions once, takes the delta against the previous
+sample's counter (kept in state.json as churn_prev / churn_prev_t; no extra sleep, so the first sample, a
+counter that went backwards, a gap over MAX_GAP_S and a missing `vm_stat` give no reading) and keeps
+`churn_since` while pages/s stay above the ALERT line LW_CHURN_ALERT_PAGES_S (default 50000; deliberately not the admit limit
+LW_MAX_COMPRESSOR_S, 20000, so standing memory pressure the gate already handles does not page hourly). Held for LW_CHURN_SUSTAIN_S (180)
+seconds it sends one line, with the top 3 commands by cores, to the watcher at most hourly (cooldown
+`churn-watcher`, WATCHER_NOCPU_S) and to Hermes every LW_COOLDOWN_H (cooldown `churn`); `status` lists both.
+When a top command matches Grok|Chrome|WindowServer the line adds the standing exception (djbclark, 2026-10-23);
+the alert itself is never suppressed. No incident row, nothing is signalled or killed; --dry-run prints and
+records nothing. Test hook: LW_FAKE_COMPRESSOR (a comma list of cumulative counters, one per read, the last
+repeating; set, it replaces vm_stat, `admit` ignores it).
+
+State: ~/.local/state/load-watch/ (state.json, incidents.jsonl, guard.jsonl, briefs/, sample.log, watcher.json).
+Registry: ~/.config/load-watch/ci-only.tsv (repo TAB mode TAB CI command or reason TAB date), read by `bg`
+through `load-watch ci check`. CI-first (djbclark, 2026-10-18): every repo `bg` builds in needs a decision.
+`ci`: `bg` refuses and names the CI command. `local`: runs here, with the reason (macOS-only, ...).
+`pending`: runs here but `bg` reminds the agent to investigate (repos seeded from 7 days of `bg` use).
+No row: `bg` refuses (exit 3) until the agent investigates offloading (GitHub runners: `forgejo-ci` skill section 6 item 6) and decides.
+A git worktree or cow pasture with no row of its own takes its main repo's row; a key ending in `/*`
+covers every repo under that directory. Older 3-column rows (repo, CI command, date) read as `ci`.
+Admission (operator, 2026-10-19): `admit` is the dispatcher-facing predicate a launcher calls before it
+starts an agent (`--load-wait`, `--no-load-gate` on the transitional acp-dispatch shim). It reads os.getloadavg()[0] / os.cpu_count() and says
+`admit ok load1=X per_core=Y cores=N` (exit 0) when the per-core load is at most --max-per-core (default
+1.5; `bg`'s own base is 2.5 since 2026-11-01 and it passes that; the 4.0 boost below usually decides, and LW_LOAD_PER_CORE is only this watcher's blame step), else
+`admit hot ...` (exit 75, EX_TEMPFAIL). When state.json is fresh the line also carries the watcher's
+`streak` and `hot_for_s`, so a sustained-hot machine reads as such. `--wait 0` (default) is a pure check;
+`--wait S` polls every 15 s for up to S seconds, prints one line per waited minute to stderr, and once the
+load drops below the threshold sleeps a random 5-30 s, never past --wait (so queued dispatchers do not all start together)
+and re-checks. `--json` prints one JSON object with the same fields. A `--wait S` (S > 0) registers its own deadline (2026-11-02,
+docs/deadline.md; bin/deadline_wait.py): `admit-wait-<pid>`, budget min(S, 30 min) + 60 s (the B9 admission class maximum),
+owner $PASEO_AGENT_ID or none (Hermes is told), heartbeat per poll; past it the enforcer kills THIS waiter's own process group (a waiter
+holds no work, nothing is lost) and admit answers exit 75 and "still too hot", never 124: callers fail open on an unknown exit. `--no-deadline` opts out; a waiter under a caller's `deadline run` (DEADLINE_NAME set)
+does not register again; an unusable deadline tool is one stderr warning and the wait goes on. It only decides whether to START work:
+it never kills, throttles or signals anything. Memory gate (operator 2026-10-23, "your recommended is fine"; tightened 2026-11-01):
+`admit` samples macOS `vm_stat` twice, 2 s apart, and says no (exit 75) while ANY of these holds: available memory (free +
+file-backed + purgeable pages: memory freed without compressing or swapping, like Linux MemAvailable's file-cache
+term; free + speculative alone is nearly always tiny on macOS) is below --min-free-mb (default 300, operator 2026-11-01; 600 before; env LW_MIN_FREE_MB); compressor churn (Compressions + Decompressions, pages/s)
+exceeds --max-mem-churn (default 20000, env LW_MAX_COMPRESSOR_S; 60000 until 2026-11-01) AND corroborates thrash: load above
+LW_CHURN_THRASH_PER_CORE (1.5) per core or pageins over their limit, or churn above LW_MAX_COMPRESSOR_HARD_S (60000) on its own
+(djbclark 2026-11-02: standing churn with idle CPU had refused nearly every launch for hours); pageins exceed --max-pageins per
+second (default 1000, env LW_MAX_PAGEINS_S: macOS `Pageins` also counts file-backed reads, so read-heavy work can trip it
+with memory to spare; that errs toward waiting); or, ONLY when the caller passes --max-agents (a dispatcher that STARTS
+agents does; `bg` never does: a test run starts no agent, and gating it would starve the very sessions the cap counts),
+the live Paseo agents machine-wide (`paseo ls -g --background --json`, status `running` or `initializing`; retired
+Wave 6 shim process names are never counted) number N or more (bare --max-agents = 14, env LW_MAX_AGENTS,
+0 = no cap: THE knob to tune how many agent slices may START); an admission under the cap is recorded as a reservation
+(agent-reservations.json, flock) counted with the live ones until `load-watch release ID` (the dispatcher does it at
+spawn) or LW_RESERVE_S (1200), so concurrent dispatchers cannot all pass at 13 of 14 (--no-reserve: records none but
+still counts the held ones; LW_RESERVE_S=0: off). A vm_stat or `paseo ls` that exists but fails, times out or prints
+nonsense refuses too (`memory_unreadable`, `agents_unreadable`): that is likeliest when the machine is starving. Only an
+absent tool (Linux without vm_stat, no /proc, no `paseo`) leaves its gate open,
+listed in `unreadable`. Why, measured 2026-11-01 (load watcher d8891c91):
+load 35-70 on this 8-core, 16 GB Mac was memory starvation, not CPU: ~64 MB free, ~12k compressions+decompressions/s,
+~1760 pageins/s, kernel_task 57% and sys 25-39% of CPU, 31+ live agent processes (omp 20, copilot 11, claude 8, agy 3); the
+4.0 calm boost let a slice start in every brief dip and each start pushed memory back over. The 2026-10-23 calibration of
+the churn line (215 ten-second samples: calm tail 11-22k, load 10-25 p50 49k, load >=25 p50 80k and p90 108k pages/s) set
+60000; 2026-11-01 showed starvation at 12k, so it is 20000. Load and swap alone did not separate that spike from a calm hour.
+Runaway Chrome (operator 2026-10-25): the sample step tells the watcher (never kills) when one Google Chrome process
+(not "Chrome for Testing") has used LW_CHROME_CORES (0.9) or more for LW_CHROME_SUSTAIN_S (300), once an hour per pid, with its kind, the
+URL on its command line when it has one, and role-aware Task Manager (Shift+Esc) advice: match the pid and
+report the task; a browser/GPU alert does not identify a busy tab. Only an identified tab may be ended by the operator.
+mds probe (2026-11-01, ported onto Wave 6 Paseo counting 2026-11-10 from #231): when root's Spotlight `mds` has used
+LW_MDS_CORES (0.5) or more over consecutive samples spanning LW_MDS_SUSTAIN_S (120; a gap over LW_MDS_MAX_GAP_S, 90 s,
+restarts the span), one log line per LW_MDS_COOLDOWN_S (1800) names mds, Finder and the six busiest other processes by
+program name only. No ping, no signal, no root required; an optional installed root helper may append XPC clients.
+Calm boost (operator 2026-10-25): while churn is known and at most --boost-max-churn (default = the compressor limit, 20000; 25000 until 2026-11-01)
+the per-core limit is --boost-per-core (default 4.0, was 2.0 until 2026-11-01; 0 turns it off) instead of --max-per-core, even when a caller such as `bg`
+passes its base; at higher churn, or when churn cannot be read, the base limit holds. Hysteresis (2026-11-01): the boost
+applies only after the machine has stayed calm (churn at most the boost line, free memory above the floor, pageins under
+their limit) for LW_BOOST_CALM_S (600) seconds without a break; any hot reading, by `admit` or by the 20 s `sample` step,
+resets the clock (calm.json in the state dir, written atomically; a gap over 120 s between readings also restarts it; the
+result's `calm_for_s` and `status` show the run). The result and `--json` `max_per_core` are the
+limit in force. Swap is not the signal (86-92% in calm hours too). The result and the `--json`
+record carry `mem_churn_pages_s`, `free_mb`, `pageins_s`, `agents` and `refused` (the names of the gates that said no: load,
+compressor, free_mem, pageins, agents); a reading that cannot be taken is listed in `unreadable` and its gate stays open
+(Linux reads /proc/meminfo MemAvailable and /proc/vmstat pswpin+pswpout and pgmajfault as the equivalents). Test hooks
+(a dispatcher that starts agents should scrub them from the environment it gives admit): LW_FAKE_LOAD1 (a load, or a comma list read one per poll
+with the last value repeating), LW_FAKE_CHURN, LW_FAKE_FREE_MB, LW_FAKE_PAGEINS, LW_FAKE_AGENTS (the same for each reading;
+a faked load leaves the readings it does not fake healthy: churn 0, 8192 MB free, 0 pageins, 0 agents),
+LW_ADMIT_POLL_S (15, floored at 1), LW_ADMIT_STAGGER_S ("5,30" min,max; 0 <= min <= max <= 60). A state.json
+that is not a dict with numeric `t` and `hot_since` counts as no state. Non-finite --wait or --max-per-core: exit 2.
+Exit: 0 ok, 1 nothing found (check, ack of an unknown id), 2 usage; `admit` also 75 (still too hot).
+"""
+import argparse
+import json
+import math
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+ADE = Path(__file__).resolve().parent.parent
+STATE_DIR = Path(os.environ.get("LW_STATE_DIR", HOME / ".local/state/load-watch"))
+REGISTRY = Path(os.environ.get("LW_REGISTRY", HOME / ".config/load-watch/ci-only.tsv"))
+PLIST = ADE / "launchd" / "com.djbclark.load-watch.plist"
+LABEL = "com.djbclark.load-watch"
+HERMES_PING = HOME / ".local/bin/hermes-ping"
+
+LOAD_PER_CORE = float(os.environ.get("LW_LOAD_PER_CORE", "4.0"))  # was 2.0 until 2026-11-01 (operator: 3.5 per core is not too bad)
+SUSTAIN_S = float(os.environ.get("LW_SUSTAIN_S", "300"))  # seconds of continuous hot load
+MAX_GAP_S = 900  # a longer gap between samples is a sleep, not load
+MIN_CORES = float(os.environ.get("LW_MIN_CORES", "1.5"))
+COOLDOWN_S = float(os.environ.get("LW_COOLDOWN_H", "6")) * 3600
+WATCHER_NOCPU_S = 3600  # the watcher is told of unexplained sustained load at most this often
+MY_UID = os.getuid()
+STUCK = []  # commands ps saw in state U this sample
+PSTATE = {}  # pid -> (ps state, rss in KB) this sample, for the job guard
+BGRUN = []  # commands runnable at background priority this sample
+
+
+def now():
+    return time.time()
+
+
+def stamp(t=None):
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t or now()))
+
+
+def log(msg):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(STATE_DIR / "sample.log", "a") as f:
+        f.write(f"{stamp()} {msg}\n")
+
+
+def load_state():
+    try:
+        return json.loads((STATE_DIR / "state.json").read_text())
+    except (OSError, ValueError):
+        return {"samples": [], "streak": 0, "cooldown": {}}
+
+
+def save_state(st):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_DIR / "state.json.tmp"
+    tmp.write_text(json.dumps(st))
+    tmp.replace(STATE_DIR / "state.json")
+
+
+def ps_table():
+    """pid -> (ppid, uid, cores now, command), one ps call. `%cpu` is the kernel's decayed recent share, so a
+    snapshot every 20 s averages to an unbiased per-process estimate, short-lived compilers included (a
+    `time` difference misses every process that starts and exits between samples, and macOS `ps -S` does
+    not fold exited children into the parent: checked 2026-10-18)."""
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,ppid=,uid=,%cpu=,state=,pri=,rss=,command="], capture_output=True,
+                             text=True, timeout=20).stdout
+    except subprocess.TimeoutExpired:  # the machine is stalling (2026-10-18, load 77): skip this sample
+        return None
+    table = {}
+    for line in out.splitlines():
+        parts = line.split(None, 7)
+        if len(parts) < 7 or not parts[0].isdigit():
+            continue
+        cmd = parts[7] if len(parts) > 7 else ""
+        PSTATE[parts[0]] = (parts[4], int(parts[6]) if parts[6].isdigit() else 0)
+        if parts[4].startswith("U"):  # uninterruptible wait: counts in load, uses no CPU
+            STUCK.append(cmd[:80] or parts[0])
+        # runnable at background QoS (priority 4: E-cores only, throttled). A pile of these is load with idle
+        # P-cores: 2026-10-18's load 110 was orphaned agent-radar scans at background QoS.
+        if parts[4].startswith("R") and parts[5] == "4":
+            BGRUN.append(" ".join(os.path.basename(w) for w in cmd.split()[:2])[:60])
+        try:
+            table[parts[0]] = (int(parts[1]), int(parts[2]), float(parts[3]) / 100, cmd)
+        except ValueError:
+            continue
+    return table
+
+
+def window(st):
+    """pid -> [cores summed over the kept samples, uid, command], and the number of samples (so sum / n is the
+    mean)."""
+    use = {}
+    for s in st["samples"]:
+        for pid, (cores, uid, cmd, _) in s["d"].items():
+            row = use.setdefault(pid, [0.0, uid, cmd])
+            row[0] += cores
+    return use, len(st["samples"])
+
+
+def ppids(st, table):
+    """pid -> ppid, from the window's samples (processes that have exited since) and the current table."""
+    out = {pid: r[3] for s in st["samples"] for pid, r in s["d"].items()}
+    out.update({pid: row[0] for pid, row in table.items()})
+    return out
+
+
+def git_top(path):
+    try:
+        r = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"], capture_output=True, text=True,
+                           timeout=5)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+# ---- attribution: which Paseo agent ran the work (slim-down E5, 2026-11-06) ----------------------------------
+# `paseo ls -g --background --json` is the agent list (archived agents left out: the JSON has no field that would tell
+# them apart): id, shortId, name, provider ("claude/<model>"), status, cwd (with `~` for the home directory) and
+# background, but no pid, no session id and no labels (docs/slim/research/wave3-2026-11-06.md
+# item 2). So a process is joined to an agent by working directory, never by ancestry: its own cwd, else the nearest
+# ancestor's (a cargo or brew child runs in a temp dir), equal to exactly one agent's cwd; failing that, its own cwd's
+# git top-level equal to exactly one agent's (a daemon such as Gradle's, or a build in a subdirectory). Several agents
+# on the same cwd (or repo) is NOT guessed: the process, its cwd and the candidate agents go to the operator notice.
+# An agent whose cwd is / or the home directory is never joined (it would own every daemon and app started there).
+PASEO_LS = ("ls", "-g", "--background", "--json")  # every workspace, background agents in, archived agents out
+PROC_CWD = os.path.exists("/proc/self/cwd")  # Linux: read /proc/PID/cwd; macOS (no /proc): lsof (review rule 5)
+
+
+DELIVERED = ("sent", "completed")  # `paseo send` .status words that mean the line arrived; `queued` does not
+
+
+def paseo_cli():
+    return os.environ.get("PASEO_CLI") or "paseo"
+
+
+def paseo_env(home=None):
+    """The environment for a `paseo` call from this watcher: PASEO_AGENT_ID unset so the daemon does not wrap a send as
+    agent-to-agent text (load-watch runs from launchd, but a test or an agent may run it by hand)."""
+    env = {k: v for k, v in os.environ.items() if k not in ("PASEO_AGENT_ID", "PASEO_AGENT_CWD")}
+    if home:
+        env["PASEO_HOME"] = home
+    return env
+
+
+def expand_cwd(cwd):
+    """An agent's cwd as `paseo ls` prints it (`~` for $HOME), as a real path comparable with a process's cwd."""
+    cwd = cwd.strip()
+    if cwd == "~" or cwd.startswith("~/"):
+        cwd = str(HOME) + cwd[1:]
+    return os.path.realpath(cwd) if cwd.startswith("/") else ""
+
+
+def paseo_agents():
+    """(agents, None) from `paseo ls -g --background --json`, each {id, short, name, provider, status, cwd}; or (None, why) when
+    there is no `paseo`, it fails, times out or prints something that is not a list of agents. Never raises."""
+    cli = paseo_cli()
+    try:
+        r = subprocess.run([cli, *PASEO_LS], capture_output=True, text=True, timeout=30, env=paseo_env())
+    except FileNotFoundError:
+        return None, f"no `{cli}` on PATH"
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, f"`{cli} ls` failed ({e.__class__.__name__})"
+    if r.returncode != 0:
+        return None, f"`{cli} ls` exited {r.returncode}: {' '.join((r.stderr or r.stdout or '').split())[:120]}"
+    try:
+        rows = json.loads(r.stdout)
+    except (TypeError, ValueError):
+        return None, f"`{cli} ls --json` printed no JSON"
+    if not isinstance(rows, list):
+        return None, f"`{cli} ls --json` printed no list of agents"
+    agents = []
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"]:
+            continue
+        try:
+            cwd = expand_cwd(row["cwd"]) if isinstance(row.get("cwd"), str) else ""
+        except ValueError:  # a NUL in the path: this row only
+            cwd = ""
+        if not cwd:
+            continue  # an agent with no usable cwd can never be joined
+        agents.append({"id": row["id"], "short": str(row.get("shortId") or row["id"][:8]),
+                       "name": str(row.get("name") or ""), "provider": str(row.get("provider") or ""),
+                       "status": str(row.get("status") or ""), "cwd": cwd})
+    return agents, None
+
+
+def agent_label(a):
+    return f"{a['short']} {a['name'] or '-'} ({a['provider'] or '?'}, {a['status'] or '?'})"
+
+
+# Agent CLIs by binary name: a walk up from a busy process stops at the first of these (with the providers `paseo ls`
+# names), so work is never pinned on whatever daemon, multiplexer or shell above the agent shares a cwd with another one.
+# Wave 6 (2026-11-09): `paseo` is the harness; retired Wave 6 shim names are never agent CLIs.
+AGENT_CLIS = frozenset({"claude", "codex", "opencode", "omp", "pi", "gemini", "copilot", "cursor-agent", "agy",
+                        "crush", "kimi", "qwen", "goose", "aider", "amp", "droid", "kiro-cli", "paseo"})
+RETIRED_AGENT_NAMES = frozenset({"acp-run", "acp-dispatch"})  # negative matchers / tests; never live agent classes
+
+
+def cli_heads(cmd):
+    return {os.path.basename(w) for w in cmd.split()[:2]}
+
+
+def own_process(agent, cmd):
+    """True when `cmd` is the agent's own CLI (the provider's binary: `claude`, `codex`, ...): its TUI's CPU is not
+    build work, as the pid exclusion was before Paseo."""
+    head = agent["provider"].split("/")[0]
+    return bool(head) and head in cli_heads(cmd)
+
+
+def top_rows(use, span):
+    """[(pid, uid, row)] for every process that used at least 0.1 cores on average over the window, busiest first."""
+    rows = []
+    for pid, (secs, uid, cmd) in sorted(use.items(), key=lambda kv: -kv[1][0]):
+        cores = secs / span if span else 0
+        if cores < 0.1:
+            break
+        rows.append((pid, uid, {"pid": int(pid), "cores": round(cores, 2), "cmd": cmd[:300]}))
+    return rows
+
+
+def attribute(use, span, parent, cmds=None):
+    """Group the window's CPU by Paseo agent. Returns (per-agent groups, loose rows, unsure rows, why): `unsure` rows
+    joined several agents (each carries `cwd` and `candidates`), `loose` rows joined none, and `why` is None, or the
+    reason there is no attribution at all (no `paseo`, a failed `paseo ls`): then every row is loose. `cmds` (pid ->
+    command, the window's and the live table's) lets the walk up the ancestors stop at the first agent CLI: that
+    agent's cwd decides, and if it joins no agent (or several) the row is loose (or unsure), never attributed to an agent
+    higher up. Never raises for a missing or broken `paseo`."""
+    cmds = cmds or {}
+    rows = top_rows(use, span)
+    agents, why = paseo_agents()
+    if agents is None:
+        return {}, [r for _p, _u, r in rows], [], why
+    clis = AGENT_CLIS | {a["provider"].split("/")[0] for a in agents if a["provider"]}
+    by_cwd = {}
+    broad = {"/", os.path.realpath(HOME)}  # an agent sitting in / or ~ would own every daemon and app: never joined there
+    for a in agents:
+        if a["cwd"] not in broad:
+            by_cwd.setdefault(a["cwd"], []).append(a)
+    chains = {}
+    for pid, uid, _row in rows:
+        if uid != MY_UID:  # another user's process: lsof cannot read its cwd, and no agent of ours runs as them
+            continue
+        chain, q = [], pid
+        while q and q not in ("0", "1") and len(chain) < 64:
+            chain.append(q)
+            if cli_heads(cmds.get(q, "") or use.get(q, [0, 0, ""])[2]) & clis:
+                break  # an agent's own CLI: its cwd is the last one that may decide
+            q = str(parent.get(q, ""))
+        chains[pid] = chain
+    cwds = proc_cwds({q for c in chains.values() for q in c})
+    tops, agent_tops = {}, None
+    groups, loose, unsure = {}, [], []
+    for pid, _uid, row in rows:
+        found, where = [], ""
+        for q in chains.get(pid, []):
+            if cwds.get(q) in by_cwd:
+                found, where = by_cwd[cwds[q]], cwds[q]
+                break
+        if not found and cwds.get(pid):
+            top = tops.setdefault(cwds[pid], git_top(cwds[pid]))
+            if top:
+                if agent_tops is None:
+                    agent_tops = {}
+                    for c, ags in by_cwd.items():
+                        agent_tops.setdefault(tops.setdefault(c, git_top(c)), []).extend(ags)
+                found, where = agent_tops.get(top, []), top
+        if not found:
+            loose.append(row)
+        elif len(found) > 1:
+            unsure.append({**row, "cwd": where, "candidates": [agent_label(a) for a in found]})
+        else:
+            owner = found[0]
+            g = groups.setdefault(owner["id"], {"session": {**owner, "agent": owner["provider"]}, "cores": 0.0,
+                                                "procs": []})
+            if not own_process(owner, row["cmd"]):
+                g["cores"] += row["cores"]
+                g["procs"].append(row)
+    return groups, loose, unsure, None
+
+
+def forgejo_remote(top):
+    try:
+        r = subprocess.run(["git", "-C", top, "remote", "-v"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return next((ln.split()[1] for ln in r.stdout.splitlines() if "forgejo" in ln), "")
+
+
+BG_REAL = os.path.realpath(HOME / "ops/site-djbclark/bin/bg")
+BG_PATH = re.compile(r"(^|/)site-[^/]+/bin/bg$")
+SHELLS = {"bash", "sh", "zsh", "env"}
+
+
+def proc_cmds(st, table):
+    """pid -> command, from the window's samples (processes that have exited since) and the current table."""
+    out = {pid: r[2] for s in st["samples"] for pid, r in s["d"].items()}
+    out.update({pid: row[3] for pid, row in table.items()})
+    return out
+
+
+def proc_cwds(pids):
+    """pid -> working directory for every live pid in `pids`: /proc/PID/cwd on Linux, else one lsof call (macOS)."""
+    pids = sorted({str(p) for p in pids if p})
+    if not pids:
+        return {}
+    if PROC_CWD:
+        out = {}
+        for p in pids:
+            try:
+                out[p] = os.readlink(f"/proc/{p}/cwd")
+            except OSError:  # exited, or not ours
+                continue
+        return out
+    try:
+        r = subprocess.run(["lsof", "-a", "-d", "cwd", "-Fpn", "-p", ",".join(pids)], capture_output=True,
+                           text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    out, cur = {}, None
+    for ln in r.stdout.splitlines():
+        if ln.startswith("p"):
+            cur = ln[1:]
+        elif ln.startswith("n") and cur:
+            out[cur] = ln[1:]
+    return out
+
+
+def bg_args(cmd):
+    """The words after `bg` when `cmd` is a run of ops/site-*/bin/bg (the script or the interpreter running it),
+    else None."""
+    words = cmd.split()
+    for i, w in enumerate(words[:4]):
+        if w.endswith("/bin/bg") and (BG_PATH.search(w) or os.path.realpath(w) == BG_REAL) and (
+                i == 0 or os.path.basename(words[i - 1]) in SHELLS or words[i - 1].startswith("-")):
+            return words[i + 1:]
+    return None
+
+
+def bg_rule(args):
+    """Which of bg's `ci`-mode exceptions (`ci_release`, `ci_targeted` in site-djbclark/bin/bg) these arguments
+    match; '' when neither. A cheap re-reading of those rules, so a hint, not a verdict."""
+    if "--local-tests" not in args:
+        for i, a in enumerate(args):
+            base = os.path.basename(a)
+            if base == "release.py" or (base == "just" and next((x for x in args[i + 1:] if not x.startswith("-")),
+                                                                  "").startswith(("release", "release-"))):
+                return "release"
+    if any(os.path.basename(a) in ("pytest", "py.test", "gradle", "gradlew") or a in ("pytest", "unittest")
+           for a in args) and any(a.startswith(("-k", "--tests")) or "::" in a or re.search(r"test\w*\.py$", a)
+                                  for a in args):
+        return "targeted test"
+    return ""
+
+
+def work_repos(g, session_top, parent, cmds):
+    """Where the group's processes really worked, for an incident brief only (lsof and git: never per sample).
+    A process belongs to the repo of its own working directory, else of its nearest ancestor's (a brew or cargo
+    child runs in a temp or build dir), up the chain to init (Paseo gives no TUI pid to stop at). Whether an ancestor is `bg` is read
+    from the same chain. 2026-10-18 incident 20261018-2056-82c4844a blamed the session's cwd for rustc under
+    `brew reinstall`, started by `just release` in another repo through bg. Falls back to the session's repo,
+    labelled a guess, when nothing maps."""
+    procs = sorted(g["procs"], key=lambda p: -p["cores"])[:40]
+    chains = {}
+    for p in procs:
+        chain, q = [], str(p["pid"])
+        while q and q not in ("0", "1") and len(chain) < 64:
+            chain.append(q)
+            q = str(parent.get(q, ""))
+        chains[p["pid"]] = chain
+    cwds = proc_cwds({q for c in chains.values() for q in c})
+    tops = {}
+    repos, unmapped = {}, 0.0
+    for p in procs:
+        chain = chains[p["pid"]]
+        top = ""
+        for q in chain:
+            if cwds.get(q):
+                tops.setdefault(cwds[q], git_top(cwds[q]))
+                top = tops[cwds[q]]
+                if top:
+                    break
+        args = next((a for a in (bg_args(cmds.get(q, "")) for q in chain) if a is not None), None)
+        if not top:
+            unmapped += p["cores"]
+            continue
+        r = repos.setdefault(top, {"top": top, "cores": 0.0, "bg_cores": 0.0, "rule": ""})
+        r["cores"] += p["cores"]
+        if args is not None:
+            r["bg_cores"] += p["cores"]
+            r["rule"] = r["rule"] or bg_rule(args)
+    guess = not repos
+    if guess and session_top:
+        repos[session_top] = {"top": session_top, "cores": g["cores"], "bg_cores": 0.0, "rule": ""}
+        unmapped = 0.0
+    rows = registry()
+    out = sorted(repos.values(), key=lambda r: -r["cores"])
+    for r in out:
+        r["ci"] = decision(r["top"], rows)[1]
+        r["remote"] = forgejo_remote(r["top"])
+    return {"repos": out, "unmapped": round(unmapped, 2), "guess": guess}
+
+
+MODES = ("ci", "local", "pending")
+
+
+def registry():
+    """repo -> [mode, CI command or reason, date]."""
+    rows = {}
+    try:
+        for ln in REGISTRY.read_text().splitlines():
+            parts = ln.split("\t")
+            if not parts or not parts[0] or parts[0].startswith("#"):
+                continue
+            if len(parts) > 1 and parts[1] in MODES:
+                rows[parts[0]] = (parts[1:] + ["", ""])[:3]
+            else:  # pre-2026-10-18 row: repo, CI command, date
+                rows[parts[0]] = ["ci"] + (parts[1:] + ["", ""])[:2]
+    except OSError:
+        pass
+    return rows
+
+
+def write_registry(rows):
+    REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+    tmp = REGISTRY.with_suffix(".tmp")
+    tmp.write_text("# repo top-level (or DIR/*)\tci|local|pending\tCI command, or why local\tdecided\n" +
+                   "".join(f"{k}\t{v[0]}\t{v[1]}\t{v[2]}\n" for k, v in sorted(rows.items())))
+    tmp.replace(REGISTRY)
+
+
+def main_worktree(top):
+    """The main checkout of a linked git worktree, else ''."""
+    try:
+        r = subprocess.run(["git", "-C", top, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    common = r.stdout.strip()
+    return os.path.dirname(common) if r.returncode == 0 and common.endswith("/.git") else ""
+
+
+def pasture_source(top):
+    """The checkout a cow pasture was made from (~/.cow/state.json records it), else ''."""
+    try:
+        pastures = json.loads((HOME / ".cow/state.json").read_text()).get("pastures") or []
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return next((p.get("source") or "" for p in pastures if isinstance(p, dict) and p.get("path") == top), "")
+
+
+def decision(top, rows):
+    """(key, row) deciding `top`: its own row, its main worktree's or pasture source's, or a DIR/* row."""
+    for key in (top, main_worktree(top), pasture_source(top)):
+        if key and key in rows:
+            return key, rows[key]
+    globs = [k for k in rows if k.endswith("/*") and (top + "/").startswith(k[:-1])]
+    if globs:
+        key = max(globs, key=len)
+        return key, rows[key]
+    return "", None
+
+
+def repo_line(r):
+    """One repo's Forgejo remote, CI decision and whether it ran under bg."""
+    where = (f"It has a Forgejo remote: `{r['remote']}` (MIT/SIPB CI)." if r["remote"] else
+             "It has no Forgejo remote (a GitHub-sourced repo uses GitHub runners).")
+    mode, text = (r["ci"] or ["", ""])[:2]
+    if r["bg_cores"] and r["bg_cores"] >= r["cores"] - 0.05:
+        ran = "It ran under `bg`" + (f" (through bg's {r['rule']} rule)" if r["rule"] and mode == "ci" else "")
+    elif r["bg_cores"]:
+        ran = f"{r['bg_cores']:.1f} of its {r['cores']:.1f} cores ran under `bg`, the rest outside it"
+    else:
+        ran = "It ran outside `bg`"
+    if mode == "ci":
+        verdict = f"Registered CI-first (`ci`: `{text}`). {ran}" + (
+            ", which lets a targeted test or a release through; if this was neither, tell djbclark." if r["bg_cores"]
+            and not r["rule"] else "." if r["bg_cores"] else ", which refuses builds there; something bypassed it.")
+    elif mode:
+        verdict = f"Decision: `{mode}` ({text}). {ran}."
+    else:
+        verdict = f"No CI decision yet. {ran}."
+    return f"{where} {verdict}"
+
+
+def brief(inc, g, work, load1, ncpu):
+    s = g["session"]
+    procs = "\n".join(f"{i}. pid {p['pid']}, {p['cores']} cores: `{p['cmd'][:200]}`"
+                      for i, p in enumerate(sorted(g["procs"], key=lambda p: -p["cores"])[:8], 1))
+    repos, stop = work["repos"], s.get("cwd")
+    if work["guess"]:
+        r = repos[0] if repos else None
+        where = (f"Repo (a guess: no process's working directory, nor its ancestors', is in a git repo, so this is "
+                 f"the session's cwd): `{r['top']}`. {repo_line(r)}" if r else "The work ran outside any git repo.")
+    elif len(repos) == 1:
+        where = f"Repo (from the processes' working directories): `{repos[0]['top']}`. {repo_line(repos[0])}"
+    else:
+        where = ("The work ran in several repos (from the processes' working directories):\n\n" + "\n".join(
+            f"{chr(96 + i)}. `{r['top']}`, {r['cores']:.1f} of those cores. {repo_line(r)}"
+            for i, r in enumerate(repos, 1)))
+    if not work["guess"] and work["unmapped"] >= 0.1:
+        where += f"\n{work['unmapped']:.1f} cores ran in no git repo."
+    if not work["guess"] and stop and all(not str(stop).startswith(r["top"]) for r in repos):
+        where += f"\nYour session's cwd (`{stop}`) is outside {'it' if len(repos) == 1 else 'them'}."
+    todo = [r for r in repos if (r["ci"] or [""])[0] not in ("ci", "local")]
+    if todo:
+        adds = "\n".join(f"   `~/src/djbclark-ade/bin/load-watch ci-only add {r['top']} \"<the command that runs it on CI>\"`"
+                         for r in todo)
+        step4 = f"""4. Once a CI job runs, register the repo so `bg` refuses heavy local runs and names your command:
+{adds}"""
+    else:
+        step4 = ("4. Nothing to register: every repo above already has a decision (`ci` or `local`). If `bg` let "
+                 "heavy work through that it should have refused, say so in your ack.")
+    return f"""# load-watch incident {inc}
+
+Written {stamp()} by `~/src/djbclark-ade/bin/load-watch` (no model). Load was {load1:.1f} on {ncpu} cores
+(threshold {LOAD_PER_CORE} per core) for {SUSTAIN_S / 60:g}+ min, and your session
+({s.get('agent')} `{s.get('name') or s['id']}`, cwd `{s.get('cwd')}`) used about {g['cores']:.1f} cores of it:
+
+{procs}
+
+{where}
+
+## What to do
+
+1. Finish the step you are on. Do not kill or restart running work to obey this (it is already paid for);
+   just do not start another heavy local run of this kind.
+2. Next time, run this kind of build or test on CI: load the CI-offload skill from the
+   loopback-port-shim repo (`~/src/loopback-port-shim/skills/`; section 6 item 6 is the recipe for a repo whose
+   source of truth is on GitHub: an orphan `ci/base` branch with a workflow and a `scripts/github-*`
+   wrapper that pushes `ci/run/<slug>` to free GitHub runners; Forgejo/Hyades only for MIT/SIPB work).
+3. Pushing branches to a repo djbclark does not own, or creating a Forgejo repo, is outward-facing: ask
+   djbclark first (one AskUserQuestion, or hermes-ping if no one is watching your session). Light work that
+   cannot move (a single small test file) goes through `~/ops/site-private/bin/bg` instead.
+{step4}
+5. If you are a fresh agent dispatched on this brief, the session that ran the work is gone: djbclark
+   dispatched you after agreeing to a CI copy, so steps 2-4 are yours.
+6. Answer this brief in one line: `~/src/djbclark-ade/bin/load-watch ack {inc} "<what you did or plan>"`.
+"""
+
+
+def notify(inc, g, top, path, load1, ncpu, dry):
+    """Tell the blamed agent by `paseo send` (its `.status` read, never the exit code) and Hermes. Returns (status, ping):
+    status is `sent` or `completed` (delivered, DELIVERED), `queued` (accepted, not delivered), `failed`, or `dry`."""
+    s = g["session"]
+    cmd = sorted(g["procs"], key=lambda p: -p["cores"])[0]["cmd"][:60] if g["procs"] else "the session itself"
+    line = (f"load-watch {inc}: load {load1:.0f} on {ncpu} cores for {SUSTAIN_S / 60:g}+ min; your processes used "
+            f"~{g['cores']:.1f} cores ({cmd}). After your current step, read {path} and act on it.")
+    status = "dry" if dry else paseo_send({"channel": "paseo", "target": s["id"]}, line)
+    who = f"{s.get('agent')} {s.get('name') or s['id']}"
+    told = ("told it" if status in DELIVERED else
+            {"queued": "paseo send queued it, not delivered", "dry": "dry run"}.get(status, f"could not reach it (paseo send: {status})"))
+    ping = (f"djbclark-ade: load-watch {inc}: {who} used ~{g['cores']:.1f} cores at load {load1:.0f} "
+            f"({cmd}); {told}; brief {path}")
+    if status not in (*DELIVERED, "dry"):  # the code-slice pick (route_agent.py plan; Wave 6: native paseo run)
+        cwd = top or s.get("cwd") or str(HOME)
+        # paseo run: prompt is positional and required; no --prompt-file (send has that).
+        ping += (f"; to hand it to a fixer: paseo run --provider cursor/default --label ade.kind=code "
+                 f"--title load-watch-{Path(path).stem} --cwd {cwd} --no-wait "
+                 f"'Read and act on the load-watch brief at {path}'")
+    if not dry and HERMES_PING.exists():
+        try:
+            subprocess.run([str(HERMES_PING), ping], capture_output=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log(f"incident ping failed: {e!r}")
+    return status, ping
+
+
+# ---- the load watcher (djbclark, 2026-10-20) -------------------------------------------------------------
+# One Paseo agent at a time owns the load loop (`load-watch watcher set`). It hears about every incident, every
+# sustained load no agent explains or that several agents could explain, and every job-guard trip, on top of the
+# blamed agent and Hermes, so someone with a model investigates. One record, so there is never a second watcher:
+# `set` replaces it and tells the one it replaced. Since 2026-11-06 the only channel is `paseo send` (the relay.py
+# pane route is gone); an older record with channel "relay" is read as no watcher, and `watcher show` says so.
+
+# What every message to the watcher says it should do (R2-11, 2026-11-06: this replaced the watcher's role skill).
+WATCHER_HOWTO = (
+    "As the load watcher: verify against the processes, not this line (`/bin/ps -axo pid,ppid,%cpu,state,etime,command -r "
+    "| head -20` and `/usr/bin/top -l 2 -s 5 -o cpu -n 20` by full path, since some agent shells shadow ps and top; "
+    "`~/src/djbclark-ade/bin/load-watch status`, `incidents -n 5`, and `admit --json` for memory churn and free memory). "
+    "Map a heavy process to its Paseo agent by working directory (`paseo ls -g --background --json`, `paseo agent inspect ID`); if it was "
+    "not told, send it one line with `paseo send --no-wait --json ID \"...\"` and read `.status` (`queued` is not delivered). "
+    "Load without CPU is processes stuck in state U, swap, or a pile at background priority. Never kill, stop or throttle "
+    "another agent's or djbclark's work without his yes: steer future runs to CI (`load-watch ci decide`), guard a "
+    "launchd job (`load-watch guard add`), and ask djbclark before creating a CI copy of a repo. Close each incident with "
+    "`load-watch ack ID \"what you found and did\"`, then tell djbclark in one line (`~/.local/bin/hermes-ping`).")
+
+
+def watcher_record():
+    try:
+        w = json.loads((STATE_DIR / "watcher.json").read_text())
+        return w if isinstance(w, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def watcher():
+    w = watcher_record()
+    return w if w and w.get("target") and w.get("channel") == "paseo" else None
+
+
+def save_watcher(w):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_DIR / "watcher.json.tmp"
+    tmp.write_text(json.dumps(w, indent=1) + "\n")
+    tmp.replace(STATE_DIR / "watcher.json")
+
+
+# A Paseo daemon restart makes `paseo send` fail for a few seconds with a coded error (2026-10-23, probed with
+# `--json` against a closed port and an empty home). The plain-text error does NOT print the code, so the argv
+# asks for --json, which writes {"error": {"code": ...}} to stderr. The four real codes are matched exactly,
+# never as a substring of the output (the message text can echo anything): DAEMON_NOT_RUNNING is what a local
+# home reports in the restart gap, DAEMON_UNREACHABLE a closed port, DAEMON_NOT_READY a daemon still starting,
+# DAEMON_CONNECTION_LOST a daemon that went away mid-request.
+SEND_TRANSIENT = ("DAEMON_UNREACHABLE", "DAEMON_CONNECTION_LOST", "DAEMON_NOT_READY", "DAEMON_NOT_RUNNING")
+SEND_RETRIES = 2          # retries after the first attempt, paseo channel only
+SEND_RETRY_PAUSE_S = 5.0
+# send_to runs inside the 20 s launchd sample (launchd never overlaps a StartInterval job, so a long call only
+# delays the next sample). A retry starts only while the whole call stays inside this budget; the first attempt
+# keeps its old 60 s timeout, so the worst case is max(60 s, ~SEND_RETRY_BUDGET_S).
+SEND_RETRY_BUDGET_S = 30.0
+# One process-wide give-up (2026-10-23): set when a send ended on a SEND_TRANSIENT code with its retries spent
+# or the budget out; the daemon is down for longer than a restart, so later send_to calls in this process make
+# one attempt each instead of paying the retries again. Process memory only: every launchd sample is a new
+# process, so the next sample retries afresh. A success clears it.
+_paseo_down = False
+
+
+def send_transient(r):
+    """True when a failed `paseo send` reports one of the SEND_TRANSIENT codes: the exact `error.code` of the
+    --json error on stderr (stdout is tried too). Anything else, including non-JSON output, is not transient."""
+    for stream in (r.stderr, r.stdout):
+        try:
+            if json.loads(stream or "").get("error", {}).get("code") in SEND_TRANSIENT:
+                return True
+        except (ValueError, AttributeError, TypeError):
+            continue
+    return False
+
+
+def send_status(r):
+    """The `.status` word of a `paseo send --no-wait --json` result on stdout (`sent` or `queued`; the wait-mode words
+    pass through), or "unknown". The exit code is never read for this: `paseo send` exits 0 for a queued line too."""
+    try:
+        d = json.loads(r.stdout or "")
+    except (TypeError, ValueError):
+        return "unknown"
+    if isinstance(d, dict) and isinstance(d.get("data"), dict):
+        d = d["data"]
+    st = d.get("status") if isinstance(d, dict) else None
+    return st if isinstance(st, str) and st else "unknown"
+
+
+def paseo_send(w, text):
+    """One line into a Paseo agent: `paseo send --no-wait --json --behavior steer -- ID TEXT` (steer, so a running turn
+    takes it without being torn down; `--` so text starting with `-` is never read as an option). Returns the `.status`
+    word: `sent` (delivered), `queued` (accepted for delivery after two quiet seconds: logged "queued, not delivered"),
+    another status word, "unknown" (exit 0 and no readable status), or "failed" (no `paseo`, an error, a timeout). Retries up
+    to SEND_RETRIES times, SEND_RETRY_PAUSE_S apart and inside SEND_RETRY_BUDGET_S, but only when the failure's error code
+    is exactly one of SEND_TRANSIENT (the daemon is restarting). Once a send has given up on such a code, later calls in
+    the same process make one attempt (`_paseo_down`). A retry after DAEMON_CONNECTION_LOST (or a retry killed by its
+    timeout) can deliver the line twice; the watcher investigates idempotently. Never raises."""
+    global _paseo_down
+    cli = w.get("paseo_cli") or paseo_cli()
+    env = paseo_env(w.get("paseo_home"))
+    argv = [cli, "send", "--no-wait", "--json", "--behavior", "steer", "--", w["target"], text]
+    retries = 0 if _paseo_down else SEND_RETRIES
+    started = time.monotonic()
+    status = "failed"
+    for attempt in range(retries + 1):
+        try:
+            left = 60 if attempt == 0 else min(60.0, SEND_RETRY_BUDGET_S - (time.monotonic() - started))
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=max(left, 1.0), env=env)
+        except (OSError, subprocess.TimeoutExpired):
+            break
+        if r.returncode == 0:
+            _paseo_down = False
+            status = send_status(r)
+            break
+        if not send_transient(r):
+            break
+        if attempt >= retries or time.monotonic() - started + SEND_RETRY_PAUSE_S >= SEND_RETRY_BUDGET_S:
+            _paseo_down = True
+            break
+        time.sleep(SEND_RETRY_PAUSE_S)
+    return status
+
+
+def send_to(w, text):
+    """paseo_send, as a yes or no: True only when the line was delivered (`sent`, or `completed`)."""
+    return paseo_send(w, text) in DELIVERED
+
+
+def tell_watcher(text, dry, skip=()):
+    """Tell the registered watcher, unless it is one of `skip` (the blamed session already got the brief).
+    Returns True/False for sent or failed, None when there is no watcher or it was skipped."""
+    w = watcher()
+    if not w or w["target"] in skip:
+        return None
+    if dry:
+        print(f"watcher {w['channel']} {w['target']}: {text}")
+        return None
+    st = paseo_send(w, f"load-watch, to the load watcher: {text} {WATCHER_HOWTO}")
+    ok = st in DELIVERED
+    w["last_ok" if ok else "last_fail"] = stamp()
+    save_watcher(w)
+    log(f"watcher {w['target']} " + ("queued, not delivered" if st == "queued" else st))
+    return ok
+
+
+def cmd_watcher(a):
+    w = watcher()
+    if a.op == "show":
+        old = watcher_record()
+        if not w and old and old.get("channel") == "relay":
+            print(f"the registered load watcher ({old.get('target')}) uses the relay channel, removed 2026-11-06; nothing reaches "
+                  "it. Register a Paseo agent: load-watch watcher set --paseo ID", file=sys.stderr)
+            return 1
+        if not w:
+            print("no load watcher registered", file=sys.stderr)
+            return 1
+        print(json.dumps(w, indent=1) if a.json else
+              f"{w['channel']} {w['target']} ({w.get('name') or '-'}, cwd {w.get('cwd') or '-'}) since {w.get('since')}"
+              + (f"; last told {w['last_ok']}" if w.get("last_ok") else "")
+              + (f"; last failed {w['last_fail']}" if w.get("last_fail") else ""))
+        return 0
+    if a.op == "clear":
+        if not w:
+            print("no load watcher registered")
+            return 0
+        if a.target and a.target != w["target"]:
+            print(f"load-watch: the watcher is {w['target']}, not {a.target}; left it", file=sys.stderr)
+            return 1
+        (STATE_DIR / "watcher.json").unlink(missing_ok=True)
+        print(f"cleared load watcher {w['target']}")
+        return 0
+    if a.op == "test":
+        if not w:
+            print("no load watcher registered", file=sys.stderr)
+            return 1
+        # not time-critical, so a `queued` line passes here (and only here), named as such: it is not yet delivered
+        st = paseo_send(w, a.target or "load-watch test: this agent is the registered load watcher.")
+        print({"sent": "sent to", "completed": "sent to", "queued": "queued, not delivered, for"}.get(
+            st, f"could not reach ({st})") + f" {w['channel']} {w['target']}")
+        return 0 if st in (*DELIVERED, "queued") else 1
+    # set: from --paseo, else this process's own Paseo agent
+    target = a.paseo or os.environ.get("PASEO_AGENT_ID")
+    if not target:
+        print("load-watch watcher set: no Paseo agent to register (pass --paseo ID, or run it inside a Paseo agent)",
+              file=sys.stderr)
+        return 2
+    new = {"channel": "paseo", "target": target, "name": a.name, "cwd": a.cwd or os.getcwd(), "chain": a.chain,
+           "since": stamp(), "paseo_cli": paseo_cli(), "paseo_home": os.environ.get("PASEO_HOME")}
+    save_watcher(new)
+    print(f"load watcher: {new['channel']} {target}")
+    if w and w["target"] != target:
+        print(f"replaced {w['channel']} {w['target']} ({w.get('name') or '-'}, since {w.get('since')})")
+        told = send_to(w, f"load-watch: you are no longer the load watcher; {new['name'] or target} took over at "
+                          f"{new['since']}. Stop any load-watch follow-up you were running; nothing else changes.")
+        print(f"{'told' if told else 'could not reach'} the old watcher")
+    return 0
+
+
+# ---- job guard (djbclark, 2026-10-18) -------------------------------------------------------------------
+# A frequent watchdog for launchd jobs: stop a job that hangs, eats resources, or crash-loops, cool it down,
+# re-test it, and stop it for good after GUARD_MAX_ROUNDS rounds in a day. Why: that day three jobs had
+# crash-looped ~6,000 times each since boot (landing on a Python upgrade, cua-driver "already running",
+# signal-cli unlinked) and athena-lockers' aklog hung in uninterruptible AFS wait for 15+ minutes.
+# Crash loops are checked for every job in the user's launchd domain; hangs and resources only for jobs
+# listed in GUARD (label TAB key=value,... TAB note), because daemons such as litellm legitimately use CPU.
+GUARD = Path(os.environ.get("LW_GUARD", HOME / ".config/load-watch/guard.tsv"))
+GUARD_COOLDOWN_S = float(os.environ.get("LW_GUARD_COOLDOWN_S", "5400"))  # 90 min, then a re-test
+GUARD_TEST_S = 1800        # a re-enabled job that trips within this window starts the next round
+GUARD_MAX_ROUNDS = 5       # rounds in 24 h before the job is disabled for good
+LOOP_RUNS, LOOP_WINDOW_S = 20, 600   # crash loop: this many failed restarts within this window
+# a slow crash loop (2026-10-20): litellm failed every ~32 s for 19 h after a half-finished upstream merge,
+# ~19 restarts per 10 min, just under the fast rule, 2,169 restarts and never tripped
+SLOW_LOOP_RUNS, SLOW_LOOP_WINDOW_S = 60, 7200
+LOOP_CHECK_S = 120         # `launchctl print` failing jobs at most this often
+LIMIT_KEYS = {"hang_s": 120.0, "max_cores": 0.0, "cores_s": 60.0, "max_rss_mb": 0.0, "max_runtime_s": 0.0}
+GUARD_EXEMPT = {LABEL}
+
+
+def guard_rows():
+    rows = {}
+    try:
+        for ln in GUARD.read_text().splitlines():
+            parts = ln.split("\t")
+            if not parts[0] or parts[0].startswith("#"):
+                continue
+            lim = dict(LIMIT_KEYS)
+            for kv in (parts[1] if len(parts) > 1 else "").split(","):
+                k, _, v = kv.partition("=")
+                if k.strip() in lim:
+                    try:
+                        lim[k.strip()] = float(v)
+                    except ValueError:
+                        pass
+            rows[parts[0]] = {"limits": lim, "note": parts[2] if len(parts) > 2 else ""}
+    except OSError:
+        pass
+    return rows
+
+
+def write_guard_rows(rows):
+    GUARD.parent.mkdir(parents=True, exist_ok=True)
+    tmp = GUARD.with_suffix(".tmp")
+    tmp.write_text("# launchd label\tlimits (hang_s, max_cores, cores_s, max_rss_mb, max_runtime_s; 0 = off)\tnote\n" +
+                   "".join(f"{k}\t" + ",".join(f"{a}={b:g}" for a, b in v["limits"].items()) + f"\t{v['note']}\n"
+                           for k, v in sorted(rows.items())))
+    tmp.replace(GUARD)
+
+
+def launchd_jobs():
+    """label -> (pid or None, last exit status string), one `launchctl list`."""
+    try:
+        out = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    jobs = {}
+    for ln in out.splitlines()[1:]:
+        p = ln.split("\t")
+        if len(p) == 3:
+            jobs[p[2]] = (int(p[0]) if p[0].isdigit() else None, p[1])
+    return jobs
+
+
+def job_info(label):
+    """(runs, plist path) from `launchctl print`."""
+    try:
+        out = subprocess.run(["launchctl", "print", f"gui/{MY_UID}/{label}"], capture_output=True, text=True,
+                             timeout=20).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None, ""
+    runs = re.search(r"^\s*runs = (\d+)", out, re.M)
+    path = re.search(r"^\s*path = (\S.*)$", out, re.M)
+    return (int(runs.group(1)) if runs else None), (path.group(1).strip() if path else "")
+
+
+def tree(pid, table):
+    kids = {}
+    for p, row in table.items():
+        kids.setdefault(str(row[0]), []).append(p)
+    out, todo = [], [str(pid)]
+    while todo:
+        p = todo.pop()
+        if p in table and p not in out:
+            out.append(p)
+            todo += kids.get(p, [])
+    return out
+
+
+def gevent(label, kind, detail):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(STATE_DIR / "guard.jsonl", "a") as f:
+        f.write(json.dumps({"t": stamp(), "label": label, "event": kind, "detail": detail}) + "\n")
+    log(f"guard: {label}: {kind}: {detail}")
+
+
+def gping(msg, dry):
+    if not dry and HERMES_PING.exists():
+        subprocess.run([str(HERMES_PING), f"djbclark-ade: load-watch guard: {msg}"], capture_output=True, timeout=60)
+    tell_watcher(f"job guard: {msg}.", dry)
+
+
+def guard_stop(label, reason, s, pids, table, t, dry):
+    """Boot the job out, kill its processes, start a cooldown round (or stop it for good)."""
+    if not s.get("plist"):
+        s["plist"] = job_info(label)[1]
+    rounds = [r for r in s.get("rounds", []) if t - r < 86400] + [t]
+    final = len(rounds) >= GUARD_MAX_ROUNDS
+    s.update(rounds=rounds, trip=reason, tripped=t, hot_since=None, u_since={}, run_since={})
+    if final:
+        s.update(state="permanent", until=None)
+    else:
+        s.update(state="cooldown", until=t + GUARD_COOLDOWN_S)
+    if not dry:
+        subprocess.run(["launchctl", "bootout", f"gui/{MY_UID}/{label}"], capture_output=True, timeout=30)
+        if final:
+            subprocess.run(["launchctl", "disable", f"gui/{MY_UID}/{label}"], capture_output=True, timeout=30)
+        for sig in ("-TERM", "-KILL"):
+            alive = [p for p in pids if p in table]
+            if alive:
+                subprocess.run(["kill", sig] + alive, capture_output=True, timeout=10)
+                time.sleep(2)
+    if final:
+        gevent(label, "stopped-for-good", f"{reason}; round {len(rounds)} in 24 h")
+        gping(f"stopped {label} for good after {len(rounds)} rounds today ({reason}); launchctl-disabled. "
+              f"Bring it back: ~/src/djbclark-ade/bin/load-watch guard reset {label}", dry)
+    else:
+        back = time.strftime("%H:%M", time.localtime(s["until"]))
+        gevent(label, "cooldown", f"{reason}; round {len(rounds)}/{GUARD_MAX_ROUNDS - 1} today, re-test at {back}")
+        gping(f"stopped {label} ({reason}); cooldown round {len(rounds)} of {GUARD_MAX_ROUNDS - 1} allowed today, "
+              f"re-test at {back}", dry)
+
+
+def guard_restart(label, s, jobs, t, dry):
+    """Cooldown over: load the job again and watch it for GUARD_TEST_S."""
+    plist = s.get("plist", "")
+    if label in jobs:  # someone loaded it meanwhile
+        s.update(state="testing", until=t + GUARD_TEST_S)
+        gevent(label, "re-test", "already loaded by someone else; watching it")
+        return
+    if not plist or not Path(plist).exists():
+        s.update(state="released", until=None)
+        gevent(label, "released", f"plist {plist or '?'} is gone; not restarting it")
+        return
+    if not dry:
+        r = subprocess.run(["launchctl", "bootstrap", f"gui/{MY_UID}", plist], capture_output=True, text=True,
+                           timeout=30)
+        if r.returncode != 0:
+            s.update(state="released", until=None)
+            gevent(label, "released", f"bootstrap failed ({(r.stderr or r.stdout).strip()[:120]}); left off")
+            return
+    s.update(state="testing", until=t + GUARD_TEST_S)
+    gevent(label, "re-test", f"loaded again from {plist}; watching it for {GUARD_TEST_S / 60:g} min")
+
+
+def guard(st, table, t, dry):
+    g = st.setdefault("guard", {})
+    jobs = launchd_jobs()
+    if jobs is None:
+        return
+    rows = guard_rows()
+    for label, s in list(g.items()):
+        if s.get("state") == "cooldown" and t >= s.get("until", 0):
+            guard_restart(label, s, jobs, t, dry)
+        elif s.get("state") == "testing" and t >= s.get("until", 0):
+            s.update(state="ok", until=None)
+            gevent(label, "passed", f"no trip in {GUARD_TEST_S / 60:g} min after the re-test")
+        elif s.get("state") in (None, "ok") and not s.get("rounds") and label not in rows and not s.get("loop"):
+            g.pop(label)  # nothing to remember
+    loop_check = t - st.get("guard_loop_t", 0) >= LOOP_CHECK_S
+    if loop_check:
+        st["guard_loop_t"] = t
+    for label, (pid, status) in jobs.items():
+        if label in GUARD_EXEMPT or label.startswith(("com.apple.", "application.")):
+            continue  # never Apple's own agents, nor app instances launchd tracks for the GUI
+        s = g.get(label) or {}
+        if s.get("state") in ("cooldown", "permanent", "released"):
+            continue
+        reason, pids = None, (tree(pid, table) if pid else [])
+        # a crash loop: a failing last exit and the restart count climbing
+        if loop_check and status not in ("0", "-"):
+            runs = job_info(label)[0]
+            if runs is not None:
+                hist = [h for h in s.get("loop", []) if t - h[0] <= SLOW_LOOP_WINDOW_S] + [[t, runs]]
+                s["loop"] = hist
+                fast = next(h for h in hist if t - h[0] <= LOOP_WINDOW_S)
+                for base, need in ((fast, LOOP_RUNS), (hist[0], SLOW_LOOP_RUNS)):
+                    if runs - base[1] >= need:
+                        reason = (f"crash loop: {runs - base[1]} restarts in {(t - base[0]) / 60:.0f} min, "
+                                  f"last exit {status}")
+                        break
+        elif status in ("0", "-"):
+            s.pop("loop", None)
+        lim = rows.get(label, {}).get("limits")
+        if lim and pids and not reason:
+            u = {p: s.get("u_since", {}).get(p, t) for p in pids if PSTATE.get(p, ("",))[0].startswith("U")}
+            s["u_since"] = u
+            stuck = [p for p, since in u.items() if lim["hang_s"] and t - since >= lim["hang_s"]]
+            cores = sum(table[p][2] for p in pids)
+            rss_mb = sum(PSTATE.get(p, ("", 0))[1] for p in pids) / 1024
+            runs_for = t - s.get("run_since", {}).get(str(pid), t)
+            s["run_since"] = {str(pid): s.get("run_since", {}).get(str(pid), t)}
+            if lim["max_cores"] and cores > lim["max_cores"]:
+                s["hot_since"] = s.get("hot_since") or t
+            else:
+                s["hot_since"] = None
+            if stuck:
+                reason = (f"hung: {table[stuck[0]][3][:70]} in uninterruptible wait "
+                          f"{t - u[stuck[0]]:.0f} s")
+            elif s.get("hot_since") and t - s["hot_since"] >= lim["cores_s"]:
+                reason = f"{cores:.1f} cores for {t - s['hot_since']:.0f} s (limit {lim['max_cores']:g})"
+            elif lim["max_rss_mb"] and rss_mb > lim["max_rss_mb"]:
+                reason = f"{rss_mb:.0f} MB resident (limit {lim['max_rss_mb']:g})"
+            elif lim["max_runtime_s"] and runs_for > lim["max_runtime_s"]:
+                reason = f"running {runs_for / 60:.0f} min (limit {lim['max_runtime_s'] / 60:g})"
+        elif lim and not pids:
+            s.update(u_since={}, run_since={}, hot_since=None)
+        if reason:
+            guard_stop(label, reason, s, pids, table, t, dry)
+        if s:
+            g[label] = s
+
+
+def cmd_guard(a):
+    rows, st = guard_rows(), load_state()
+    g = st.get("guard", {})
+    if a.op == "status":
+        for label, s in sorted(g.items()):
+            when = time.strftime("%H:%M", time.localtime(s["until"])) if s.get("until") else "-"
+            print(f"{label}\t{s.get('state', 'ok')}\tuntil {when}\trounds today "
+                  f"{len([r for r in s.get('rounds', []) if now() - r < 86400])}\t{s.get('trip', '')}")
+        return 0
+    if a.op == "list":
+        for k, v in sorted(rows.items()):
+            print(f"{k}\t" + ",".join(f"{x}={y:g}" for x, y in v["limits"].items()) + f"\t{v['note']}")
+        return 0
+    if not a.label:
+        print("load-watch guard add|rm|reset needs LABEL", file=sys.stderr)
+        return 2
+    if a.op == "reset" and shutil.which("launchctl") is None:
+        print("load-watch: the launchd job guard is macOS only", file=sys.stderr)
+        return 69
+    if a.op == "add":
+        lim = dict(LIMIT_KEYS)
+        for kv in a.limits:
+            k, _, v = kv.partition("=")
+            if k not in lim:
+                print(f"load-watch guard add: unknown limit {k!r} (one of {', '.join(lim)})", file=sys.stderr)
+                return 2
+            lim[k] = float(v)
+        rows[a.label] = {"limits": lim, "note": a.note or ""}
+        write_guard_rows(rows)
+    elif a.op == "rm":
+        if rows.pop(a.label, None) is None:
+            print(f"load-watch: {a.label} is not guarded", file=sys.stderr)
+            return 1
+        write_guard_rows(rows)
+    elif a.op == "reset":  # bring a stopped job back now and forget its rounds
+        s = g.pop(a.label, {})
+        plist = s.get("plist") or job_info(a.label)[1]
+        subprocess.run(["launchctl", "enable", f"gui/{MY_UID}/{a.label}"], capture_output=True, timeout=30)
+        if plist and Path(plist).exists():
+            subprocess.run(["launchctl", "bootstrap", f"gui/{MY_UID}", plist], capture_output=True, timeout=30)
+        save_state(st)
+        gevent(a.label, "reset", f"by hand; loaded from {plist or '?'}")
+    print(f"{a.op} {a.label}")
+    return 0
+
+
+CHURN_SUSTAIN_S = float(os.environ.get("LW_CHURN_SUSTAIN_S", "180"))  # seconds of churn above the alert threshold
+# The ALERT threshold, deliberately NOT the admit gate's limit (LW_MAX_COMPRESSOR_S, 20000 since 2026-11-01): the gate should stay
+# strict, but with the alert sharing that number it paged the watcher every hour for standing memory pressure (2026-11-02:
+# 29-38k pages/s at load ~0.7/core, CPU half idle, no runaway: none was an incident). 50000 is the old 60k limit's range.
+CHURN_ALERT_PAGES_S = float(os.environ.get("LW_CHURN_ALERT_PAGES_S", "50000"))
+CHURN_EXCEPTION_RE = re.compile(r"Grok|Chrome|WindowServer")
+_FAKE_COMPRESSOR_READS = [0]
+
+
+def churn_counter():
+    """Cumulative compressor pages (Compressions + Decompressions) now, or None when unreadable.
+    LW_FAKE_COMPRESSOR (tests): a comma list of counters, one per call, the last repeating; set, vm_stat is not read."""
+    raw = os.environ.get("LW_FAKE_COMPRESSOR", "").strip()
+    if not raw:
+        return _compressor_pages()
+    vals = [float(x) for x in raw.split(",") if x.strip()]
+    if not vals:
+        return None
+    i = min(_FAKE_COMPRESSOR_READS[0], len(vals) - 1)
+    _FAKE_COMPRESSOR_READS[0] += 1
+    return vals[i]
+
+
+def churn_read(st, t):
+    """One compressor-churn reading per sample: pages/s as the delta since the previous sample, or None (no
+    reading: first sample, counter went backwards, a gap over MAX_GAP_S, no vm_stat). Keeps st['churn_since']
+    while the churn is above CHURN_ALERT_PAGES_S (not the admit limit). State keys are read with .get, so an older state.json loads."""
+    c = churn_counter()
+    if c is None:  # no vm_stat: change nothing
+        return None
+    prev, prev_t = st.get("churn_prev"), st.get("churn_prev_t")
+    st["churn_prev"], st["churn_prev_t"] = c, t
+    ok = isinstance(prev, (int, float)) and isinstance(prev_t, (int, float))
+    if not ok or not 0 < t - prev_t < MAX_GAP_S or c < prev:
+        st["churn_since"] = None
+        st.pop("churn_pages_s", None)
+        return None
+    rate = (c - prev) / (t - prev_t)
+    st["churn_pages_s"] = round(rate)
+    if rate <= CHURN_ALERT_PAGES_S:
+        st["churn_since"] = None
+    elif not st.get("churn_since"):
+        st["churn_since"] = t
+    return rate
+
+
+def sample_calm(st, t, churn, dry):
+    """Feed the calm-boost hysteresis (calm.json) one 20 s reading, so a quiet half hour in which nobody called
+    `admit` still counts. Calm = churn known and at most the boost line, free memory above the floor, pageins
+    under their limit; a reading that cannot be taken is not calm. Pageins are a delta against the previous
+    sample (st['pagein_prev'], .get so an older state.json loads). LW_FAKE_COMPRESSOR (tests) skips vm_stat."""
+    calm = False
+    if churn is not None and churn <= ADMIT_BOOST_CHURN_PAGES_S:
+        if os.environ.get("LW_FAKE_COMPRESSOR", "").strip():
+            calm = True
+        else:
+            try:
+                snap = vm_snapshot()
+            except ReadFailed:
+                snap = None  # a failed read is not calm
+            if snap is not None:
+                prev, prev_t = st.get("pagein_prev"), st.get("pagein_prev_t")
+                st["pagein_prev"], st["pagein_prev_t"] = snap["pageins"], t
+                if _num(prev) and _num(prev_t) and 0 < t - prev_t < MAX_GAP_S and snap["pageins"] >= prev:
+                    calm = memory_calm(churn, snap["free_mb"], (snap["pageins"] - prev) / (t - prev_t))
+    if not dry:
+        calm_note(t, calm)
+
+
+def churn_top(table, n=3):
+    """The n commands using the most cores in this ps table, same-named ones summed: [(label, cores, matches the
+    Grok/Chrome/WindowServer standing exception)]."""
+    by = {}
+    for _ppid, _uid, cores, cmd in table.values():
+        if ".app/" in cmd:  # a bundle's executable name has spaces ("Google Chrome Helper (Renderer)")
+            label = os.path.basename(cmd.split(" --")[0])
+        else:
+            label = " ".join(os.path.basename(w) for w in cmd.split()[:2])
+        label = label[:40] or "?"
+        row = by.setdefault(label, [0.0, False])
+        row[0] += cores
+        row[1] = row[1] or bool(CHURN_EXCEPTION_RE.search(cmd))
+    return [(k, v[0], v[1]) for k, v in sorted(by.items(), key=lambda kv: -kv[1][0])[:n] if v[0] > 0]
+
+
+def churn_alert(st, t, table, dry):
+    """Tell the watcher (hourly) and Hermes (every COOLDOWN_S) when churn has stayed above CHURN_ALERT_PAGES_S for
+    CHURN_SUSTAIN_S. Reads and warns only: no incident row, nothing is signalled or killed."""
+    since = st.get("churn_since")
+    if not since or t - since < CHURN_SUSTAIN_S:
+        return
+    cd = st["cooldown"]
+    ping_due = "churn" not in cd
+    last = cd.get("churn-watcher")
+    watch_due = last is None or t - last >= WATCHER_NOCPU_S
+    if not (ping_due or watch_due):
+        return
+    top = churn_top(table)
+    body = (f"compressor churn ~{st.get('churn_pages_s', 0) / 1000:.0f}k pages/s for {CHURN_SUSTAIN_S / 60:g}+ min "
+            f"(alert line {CHURN_ALERT_PAGES_S / 1000:g}k, admit limit {ADMIT_CHURN_PAGES_S / 1000:g}k); top: "
+            + (", ".join(f"{label} {cores:.1f} cores" for label, cores, _ in top) or "none") + ". "
+            "Admit already holds new bg / agent-start work; this is running or bypass work.")
+    tail = "do not kill or SIGSTOP without djbclark."
+    if any(exc for _l, _c, exc in top):  # advice shape only: the alert is never suppressed
+        tail += (" Standing exception: Grok Bot/Chrome renderers routinely use 0.3-0.7 cores each, so do not ask "
+                 "djbclark to quit or reload them for routine load; only if far above that or agents time out.")
+    full = f"load-watch: {body} {tail[0].upper() + tail[1:]}"
+    if dry:
+        print(full)
+        tell_watcher(f"{body} {tail[0].upper() + tail[1:]}", True)
+        return
+    log(f"compressor churn {st.get('churn_pages_s', 0)} pages/s since {stamp(since)}; top: {body.split('top: ')[1]}")
+    if ping_due:
+        if HERMES_PING.exists():
+            try:
+                subprocess.run([str(HERMES_PING), f"djbclark-ade: {full}"], capture_output=True, timeout=60)
+            except (OSError, subprocess.TimeoutExpired) as e:
+                log(f"churn ping failed: {e!r}")
+        cd["churn"] = t
+    if watch_due and tell_watcher(f"{body} {tail[0].upper() + tail[1:]}", False) is not None:
+        cd["churn-watcher"] = t
+
+
+CHROME_CORES = float(os.environ.get("LW_CHROME_CORES", "0.9"))
+CHROME_SUSTAIN_S = float(os.environ.get("LW_CHROME_SUSTAIN_S", "300"))
+CHROME_RE = re.compile(r"/Google Chrome\.app/Contents/")  # not "Google Chrome for Testing" (an agent's puppeteer)
+
+
+def chrome_kind(cmd):
+    m = re.search(r"--type=(\S+)", cmd)
+    return {"renderer": "tab renderer", "gpu-process": "GPU process"}.get(m.group(1), m.group(1)) if m else "browser (main) process"
+
+
+def chrome_alert(st, t, table, dry):
+    """Tell the watcher (hourly per process) when one Chrome process has used CHROME_CORES or more for
+    CHROME_SUSTAIN_S (2026-10-25: the main process sat at 97% for 11 min on one page). Warns only: no incident,
+    nothing is signalled or killed; the advice is the Task Manager (Shift+Esc), a human step."""
+    hot = {pid: (c, cmd) for pid, (_pp, _uid, c, cmd) in table.items() if c >= CHROME_CORES and CHROME_RE.search(cmd)}
+    since = {k: v for k, v in st.get("chrome_hot", {}).items() if k in {str(p) for p in hot}}  # str pids (json)
+    for pid in hot:
+        since.setdefault(str(pid), t)
+    st["chrome_hot"] = since
+    cd = st["cooldown"]
+    for pid, (cores, cmd) in hot.items():
+        key = f"chrome:{pid}"
+        if t - since[str(pid)] < CHROME_SUSTAIN_S or key in cd and t - cd[key] < WATCHER_NOCPU_S:
+            continue
+        url = re.search(r"(https?://\S+)", cmd)
+        kind = chrome_kind(cmd)
+        if kind == "tab renderer":
+            advice = (f"sort by CPU and match pid {pid} to its task. Only if the task is an identified tab and "
+                      "djbclark chooses, End process on that tab, then reload it.")
+        else:
+            advice = (f"sort by CPU and match pid {pid} to its task. Report the task name and CPU percentage; "
+                      f"a {kind} alert does not identify a busy tab. Do not end tabs based on this alert alone.")
+        body = (f"Chrome {kind} pid {pid} has used ~{cores:.1f} cores for {(t - since[str(pid)]) / 60:.0f}+ min"
+                + (f" (opened {url.group(1)[:80]})" if url else "") + ". Tell djbclark: Chrome Task Manager (Shift+Esc), "
+                + advice + " Do not kill, reload, or restart Chrome yourself.")
+        if dry:
+            print(f"load-watch: {body}")
+            continue
+        if tell_watcher(body, False) is not None:
+            cd[key] = t
+            log(body)
+
+
+MDS_CORES = float(os.environ.get("LW_MDS_CORES", "0.5"))
+MDS_SUSTAIN_S = float(os.environ.get("LW_MDS_SUSTAIN_S", "120"))
+MDS_MAX_GAP_S = float(os.environ.get("LW_MDS_MAX_GAP_S", "90"))  # samples run every ~20 s; longer is a sleep or a stall
+MDS_COOLDOWN_S = float(os.environ.get("LW_MDS_COOLDOWN_S", "1800"))
+MDS_HELPER = "/usr/local/libexec/djbclark/mds-xpc-clients"  # root:wheel 0755, one NOPASSWD sudoers line, no arguments
+MDS_PEER_RE = re.compile(r"(\d+) (\d+) ([A-Za-z0-9][A-Za-z0-9 ._+-]*)")
+
+
+def mds_peers():
+    """Processes holding a send right to mds as ["COUNT PID NAME", ...], busiest first (at most 6), or None when the
+    root helper is missing, sudo refuses (it never prompts: -n), it fails or takes over 20 s. Only lines of the
+    exact helper shape are kept; nothing is passed to the helper and nothing from it reaches a shell."""
+    if not os.path.exists(MDS_HELPER):
+        return None
+    try:
+        r = subprocess.run(["sudo", "-n", MDS_HELPER], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return [ln for ln in r.stdout.splitlines() if MDS_PEER_RE.fullmatch(ln)][:6]
+
+
+def exe_name(cmd):
+    """Basename of the program (first token) only, restricted to [A-Za-z0-9._+-]. Never an argument: those can
+    hold secrets (`env TOKEN=x cmd`, `mysql -pSECRET`) and a path argument must not make a process look like another."""
+    tok = cmd.split(None, 1)[0] if cmd.strip() else ""
+    return re.sub(r"[^A-Za-z0-9._+-]", "", os.path.basename(tok))
+
+
+def mds_probe(st, t, table, dry):
+    """Record who is busy while Spotlight's mds is (2026-11-01: mds sat at 25-70% for hours; the cause was Finder
+    re-listing /private/tmp, found only by hand with `sample` and `fs_usage`, both root). Needs no root: once mds
+    has used MDS_CORES or more over consecutive samples spanning MDS_SUSTAIN_S (a gap over MDS_MAX_GAP_S restarts
+    the span), log one line per MDS_COOLDOWN_S with mds, Finder and the six busiest other processes by program
+    name only. A log line only: it pings nobody and signals nothing. XPC client pids (`lsmp`) need root:
+    macos/mds-xpc-clients in site-public-djbclark is the root helper, a later change calls it."""
+    mds = sum(c for _pp, uid, c, cmd in table.values() if uid == 0 and exe_name(cmd) == "mds")  # root's, not a lookalike
+    last, st["mds_last"] = st.get("mds_last"), t
+    if mds < MDS_CORES or (last is not None and t - last > MDS_MAX_GAP_S):
+        st.pop("mds_hot", None)
+        if mds < MDS_CORES:
+            return
+    since = st.setdefault("mds_hot", t)
+    cd = st["cooldown"]
+    if t - since < MDS_SUSTAIN_S or t - cd.get("mds", -MDS_COOLDOWN_S) < MDS_COOLDOWN_S:
+        return
+    finder = sum(c for _pp, _uid, c, cmd in table.values() if exe_name(cmd) == "Finder")
+    others = sorted(((c, pid, exe_name(cmd)) for pid, (_pp, uid, c, cmd) in table.items()
+                     if not (uid == 0 and exe_name(cmd) == "mds")), reverse=True)[:6]
+    top = "; ".join(f"{pid} {c:.2f} {name}" for c, pid, name in others)
+    line = f"mds probe: mds {mds:.2f} cores for {(t - since) / 60:.0f}+ min, Finder {finder:.2f}; top others: {top}"
+    if dry:
+        print(f"load-watch: {line}")
+        return
+    peers = mds_peers()  # root helper; None keeps the line as it was
+    if peers:
+        line += "; xpc clients (ports pid name): " + "; ".join(peers)
+    log(line)
+    cd["mds"] = t
+
+
+def prune_cooldowns(cd, t):
+    """Drop cooldown stamps older than their hold: COOLDOWN_S, or longer for a key whose own hold is longer
+    (the mds probe's LW_MDS_COOLDOWN_S can exceed LW_COOLDOWN_H; pruned early it would log again at once)."""
+    own = {"mds": MDS_COOLDOWN_S}
+    return {k: v for k, v in cd.items() if t - v < max(COOLDOWN_S, own.get(k, 0))}
+
+
+def cmd_sample(a):
+    st = load_state()
+    t = now()
+    load1 = os.getloadavg()[0]
+    ncpu = os.cpu_count() or 1
+    hot = load1 / ncpu >= LOAD_PER_CORE
+    gap = t - st.get("t", 0)
+    st["t"] = t
+    try:  # a churn problem must never stop load sampling
+        sample_calm(st, t, churn_read(st, t), a.dry_run)
+    except Exception as e:  # noqa: BLE001
+        log(f"churn read error: {e!r}")
+    # Time, not a sample count (2026-10-18: under a load-60 stall launchd ran us every 3-7 minutes, so 15
+    # samples took 45+ min and one 7-min gap restarted the count). A gap over MAX_GAP_S is a sleep.
+    if hot and (not st.get("hot_since") or gap >= MAX_GAP_S):
+        st["hot_since"], st["samples"], st["streak"] = t, [], 0
+    elif not hot:
+        st["hot_since"], st["samples"], st["streak"] = None, [], 0
+    table = ps_table()
+    if table is None:  # a stall this bad is itself a hot sample: keep the streak going, add no CPU data
+        log(f"ps timed out at load {load1:.0f}; sample counted, no CPU data")
+        st["streak"] = st.get("streak", 0) + hot
+        save_state(st)
+        return 0
+    try:
+        guard(st, table, t, a.dry_run)
+    except Exception as e:  # noqa: BLE001 - the guard must never stop load sampling
+        log(f"guard error: {e!r}")
+    if hot:
+        d = {pid: [round(c, 2), uid, cmd[:300], ppid] for pid, (ppid, uid, c, cmd) in table.items() if c >= 0.05}
+        st["samples"] = [x for x in st.get("samples", []) if x["t"] >= t - SUSTAIN_S] + [{"t": t, "d": d}]
+        st["streak"] = st.get("streak", 0) + 1
+    st["load1"] = load1
+    st["cooldown"] = prune_cooldowns(st.get("cooldown", {}), t)
+    try:
+        churn_alert(st, t, table, a.dry_run)
+    except Exception as e:  # noqa: BLE001
+        log(f"churn alert error: {e!r}")
+    try:
+        chrome_alert(st, t, table, a.dry_run)
+    except Exception as e:  # noqa: BLE001
+        log(f"chrome alert error: {e!r}")
+    try:
+        mds_probe(st, t, table, a.dry_run)
+    except Exception as e:  # noqa: BLE001
+        log(f"mds probe error: {e!r}")
+    if a.verbose:
+        print(f"load {load1:.1f}/{ncpu} hot={hot} streak={st['streak']}")
+    if hot and t - st["hot_since"] >= SUSTAIN_S:
+        use, span = window(st)
+        parent = ppids(st, table)
+        try:  # the threat model's runaway-load response: a failed attribution reaches the operator, never stops sampling
+            groups, loose, unsure, why_none = attribute(use, span, parent, proc_cmds(st, table))
+        except Exception as e:  # noqa: BLE001
+            log(f"attribution error: {e!r}")
+            groups, unsure, why_none = {}, [], f"attribution failed ({e.__class__.__name__})"
+            loose = [r for _p, _u, r in top_rows(use, span)]
+        told = 0
+        for g in sorted(groups.values(), key=lambda g: -g["cores"]):
+            s = g["session"]
+            if g["cores"] < MIN_CORES or not g["procs"]:
+                continue
+            agent_key = f"agent:{s['id']}"
+            if agent_key in st["cooldown"] or t - st["cooldown"].get("skip:" + agent_key, 0) < 600:
+                continue
+            # the repo is the work's, not the agent's cwd (2026-10-18): lsof and git, so only for an agent
+            # about to be told, never per sample
+            work = work_repos(g, git_top(s["cwd"]) if s.get("cwd") else "", parent, proc_cmds(st, table))
+            top = work["repos"][0]["top"] if work["repos"] else ""
+            repo_keys = [f"repo:{r['top']}" for r in work["repos"]]
+            if repo_keys and all(k in st["cooldown"] for k in repo_keys):
+                st["cooldown"]["skip:" + agent_key] = t  # do not redo the lsof every 20 s sample
+                continue
+            keys = [agent_key] + repo_keys
+            inc = time.strftime("%Y%m%d-%H%M", time.localtime(t)) + f"-{s['id'][:8]}"
+            path = STATE_DIR / "briefs" / f"{inc}.md"
+            if not a.dry_run:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(brief(inc, g, work, load1, ncpu))
+            delivery, ping = notify(inc, g, top, path, load1, ncpu, a.dry_run)
+            watched = tell_watcher(ping.removeprefix("djbclark-ade: ") + ".", a.dry_run,
+                                   skip={s["id"]} if delivery in DELIVERED else ())
+            rec = {"id": inc, "t": stamp(t), "load1": round(load1, 1), "ncpu": ncpu, "cores": round(g["cores"], 2),
+                   "agent": s.get("agent"), "session": s.get("name") or s["id"], "agent_id": s["id"],
+                   "cwd": s.get("cwd"), "repo": top, "repo_guess": work["guess"],
+                   "repos": [{k: r[k] for k in ("top", "cores", "bg_cores", "rule")} for r in work["repos"]],
+                   "procs": g["procs"][:8], "relayed": delivery in DELIVERED, "delivery": delivery,
+                   "watcher_told": watched, "brief": str(path), "dry_run": a.dry_run}
+            if a.dry_run:
+                print(json.dumps(rec, indent=1))
+                print(ping)
+                continue
+            for k in keys:
+                st["cooldown"][k] = t
+            with open(STATE_DIR / "incidents.jsonl", "a") as f:
+                f.write(json.dumps(rec) + "\n")
+            log(f"incident {inc} {rec['session']} {rec['cores']} cores delivery="
+                + ("queued, not delivered" if delivery == "queued" else delivery))
+            told += 1
+        if a.verbose or a.dry_run:
+            for row in loose[:5]:
+                print(f"unattributed: pid {row['pid']} {row['cores']} cores {row['cmd'][:100]}")
+        unsure_told = unsure_notice(st, t, unsure, load1, ncpu, a.dry_run)
+        # work matched to no agent, at least MIN_CORES in one process: the operator hears it with the process lines,
+        # whether or not an agent was told in this sample (2026-11-06 review: a told agent must not hide it)
+        heavy = [r for r in loose if r["cores"] >= MIN_CORES]
+        if (why_none or heavy or not (told or unsure_told)) and not st.get("loose_logged"):
+            why = not_cpu(use, span, ncpu)
+            tops = "; ".join(f"{r['cores']} {r['cmd'][:60]}" for r in loose[:3])
+            log(("sustained load, no agent attribution (" + why_none + "); " if why_none else
+                 f"sustained load, {sum(r['cores'] for r in heavy):.1f} cores matched to no agent; " if heavy else
+                 "sustained load, no agent session above threshold; ") + why + "; top: " + tops)
+            st["loose_logged"] = True
+            # 2026-10-18: load 90 from memory starvation and a hung AFS aklog blamed no agent and told no one
+            if why_none:  # no `paseo`, a failed `paseo ls`, a crash: the operator hears it, with the top processes
+                msg = (f"load {load1:.0f} on {ncpu} cores for {SUSTAIN_S / 60:g}+ min and load-watch could not name the "
+                       f"agent behind it: {why_none}; top: {tops or 'none'}; {why}")
+                key = "noattrib"
+            elif heavy:
+                msg = (f"load {load1:.0f} on {ncpu} cores for {SUSTAIN_S / 60:g}+ min; ~{sum(r['cores'] for r in heavy):.1f} "
+                       f"cores ran in processes matched to no Paseo agent: "
+                       + "; ".join(f"pid {r['pid']} {r['cores']} cores `{r['cmd'][:80]}`" for r in heavy[:4]) + f"; {why}")
+                key = "loose"
+            else:
+                msg = (f"load {load1:.0f} on {ncpu} cores for {SUSTAIN_S / 60:g}+ min, and no agent's build and no single "
+                       f"process above {MIN_CORES:g} cores explains it; {why}")
+                key = "nocpu"
+            if a.dry_run:
+                print(f"operator notice ({key}): {msg}")
+            else:
+                operator_notice(st, t, key, msg)
+    elif not hot:
+        st.pop("loose_logged", None)
+    save_state(st)
+    return 0
+
+
+def operator_notice(st, t, key, msg):
+    """The operator-notice path: Hermes at most every COOLDOWN_S per key, the watcher at most hourly (`KEY-watcher`;
+    djbclark, 2026-10-20). Never raises for a missing or failing hermes-ping."""
+    cd = st["cooldown"]
+    if key not in cd:
+        if HERMES_PING.exists():
+            try:
+                subprocess.run([str(HERMES_PING), f"djbclark-ade: load-watch: {msg}"], capture_output=True, timeout=60)
+            except (OSError, subprocess.TimeoutExpired) as e:
+                log(f"{key} ping failed: {e!r}")
+        cd[key] = t
+    last = cd.get(key + "-watcher")
+    if last is None or t - last >= WATCHER_NOCPU_S:
+        if tell_watcher(msg + ".", False) is not None:
+            cd[key + "-watcher"] = t
+
+
+def unsure_notice(st, t, unsure, load1, ncpu, dry):
+    """Work that joined several Paseo agents (they share its cwd or repo) is never guessed: per cwd with at least
+    MIN_CORES, the operator notice gets the process lines and the candidate agents. Returns how many were reported."""
+    by = {}
+    for r in unsure:
+        by.setdefault(r["cwd"], []).append(r)
+    n = 0
+    for cwd, rows in sorted(by.items(), key=lambda kv: -sum(r["cores"] for r in kv[1])):
+        cores = sum(r["cores"] for r in rows)
+        if cores < MIN_CORES:
+            continue
+        cands = list(dict.fromkeys(c for r in rows for c in r["candidates"]))
+        procs = "; ".join(f"pid {r['pid']} {r['cores']} cores `{r['cmd'][:80]}`"
+                          for r in sorted(rows, key=lambda r: -r["cores"])[:4])
+        msg = (f"load {load1:.0f} on {ncpu} cores for {SUSTAIN_S / 60:g}+ min; ~{cores:.1f} cores ran in `{cwd}`, which "
+               f"{len(cands)} Paseo agents share, so load-watch did not guess which to tell: {procs}; candidates: "
+               + ", ".join(cands[:8]) + (f" (+{len(cands) - 8} more)" if len(cands) > 8 else ""))
+        n += 1
+        if dry:
+            print(f"operator notice: {msg}")
+            continue
+        log(f"unsure attribution {cwd}: {cores:.1f} cores, {len(cands)} candidates")
+        operator_notice(st, t, f"unsure:{cwd}", msg)
+    return n
+
+
+def not_cpu(use, span, ncpu):
+    """One line on what the load is when no session's CPU explains it: sampled CPU, swap, stuck processes."""
+    cpu = sum(r[0] for r in use.values()) / span if span else 0
+    try:
+        swap = subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True, timeout=5).stdout
+        swap = " ".join(swap.split()[:6]).replace(" = ", "=")
+    except (OSError, subprocess.TimeoutExpired):
+        swap = "?"
+    stuck = sorted(set(STUCK))
+    counts = {}
+    for c in BGRUN:
+        counts[c] = counts.get(c, 0) + 1
+    top = sorted(counts.items(), key=lambda kv: -kv[1])[:4]
+    return (f"processes used ~{cpu:.1f} of {ncpu} cores; swap {swap}; "
+            f"{len(stuck)} stuck in disk/network wait" + (f": {', '.join(stuck[:4])}" if stuck else "") +
+            f"; {len(BGRUN)} runnable at background priority" +
+            (": " + ", ".join(f"{n}x {c}" for c, n in top) if top else ""))
+
+
+def cmd_status(a):
+    st = load_state()
+    use, span = window(st)
+    print(f"load1 {st.get('load1', 0):.1f} on {os.cpu_count()} cores; hot for {now() - st['hot_since'] if st.get('hot_since') else 0:.0f}/{SUSTAIN_S:.0f} s, {st.get('streak', 0)} samples "
+          f"(threshold {LOAD_PER_CORE}/core, {MIN_CORES} cores per session, cooldown {COOLDOWN_S / 3600:g} h)")
+    for pid, (secs, _, cmd) in sorted(use.items(), key=lambda kv: -kv[1][0])[:8]:
+        print(f"  {secs / span if span else 0:5.2f} cores  pid {pid}  {cmd[:110]}")
+    if st.get("churn_pages_s") is not None:
+        print(f"  compressor churn {st['churn_pages_s'] / 1000:.0f}k pages/s (alert line {CHURN_ALERT_PAGES_S / 1000:g}k, "
+              f"admit limit {ADMIT_CHURN_PAGES_S / 1000:g}k)"
+              + (f", above the alert line for {now() - st['churn_since']:.0f}/{CHURN_SUSTAIN_S:.0f} s" if st.get("churn_since") else ""))
+    cs = calm_load().get("calm_since")
+    if _num(cs):
+        print(f"  calm boost: calm for {now() - cs:.0f}/{ADMIT_BOOST_CALM_S:g} s (the {ADMIT_BOOST_PER_CORE:g}/core boost applies after that; any hot reading resets it)")
+    for k, v in st.get("cooldown", {}).items():
+        hold = {'mds': MDS_COOLDOWN_S}.get(k, WATCHER_NOCPU_S if k.endswith('-watcher') else COOLDOWN_S)
+        print(f"  cooldown {k} until {stamp(v + hold)}")
+    return 0
+
+
+def incidents():
+    try:
+        return [json.loads(ln) for ln in (STATE_DIR / "incidents.jsonl").read_text().splitlines() if ln.strip()]
+    except OSError:
+        return []
+
+
+def cmd_incidents(a):
+    for r in incidents()[-a.n:]:
+        ack = f"  ack: {r['ack']}" if r.get("ack") else ""
+        print(f"{r['id']}  {r['t']}  load {r['load1']}  {r['agent']} {r['session']}  {r['cores']} cores  "
+              f"{r.get('repo') or r.get('cwd')}  told={r.get('delivery') or r.get('relayed')}{ack}")
+    return 0
+
+
+def cmd_ack(a):
+    rows = incidents()
+    hit = next((r for r in rows if r["id"] == a.id), None)
+    if not hit:
+        print(f"load-watch: no incident {a.id}", file=sys.stderr)
+        return 1
+    hit["ack"] = f"{stamp()} {a.note}"
+    tmp = STATE_DIR / "incidents.jsonl.tmp"
+    tmp.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    tmp.replace(STATE_DIR / "incidents.jsonl")
+    print(f"recorded ack for {a.id}")
+    return 0
+
+
+def ci_job_key(top, platform, job):
+    # Worktrees share their repository's history; wildcard policy rows do not merge unrelated repos.
+    repo = main_worktree(top) or pasture_source(top) or top
+    return json.dumps([repo, platform, job])
+
+
+def ci_attempts():
+    try:
+        data = json.loads((STATE_DIR / "ci-attempts.json").read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def record_ci_attempt(top, platform, job, attempt, result):
+    """Idempotent per-attempt updates, serialized across bg processes, replaced atomically."""
+    import fcntl
+    import tempfile
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with (STATE_DIR / "ci-attempts.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = ci_attempts()
+        key = ci_job_key(top, platform, job)
+        history = data.get(key, {})
+        if not isinstance(history, dict):
+            history = {}
+        existing = history.get(attempt, {})
+        timestamp = existing.get("t", time.time()) if isinstance(existing, dict) else time.time()
+        history[attempt] = {"result": result, "t": timestamp}
+        data[key] = history
+        with tempfile.NamedTemporaryFile(mode="w", dir=STATE_DIR, delete=False) as out:
+            json.dump(data, out)
+        os.replace(out.name, STATE_DIR / "ci-attempts.json")
+
+
+def ci_job_route(top, platform, job, slow=False):
+    """CI first; macOS retries may run here at load <=16, or ungated after two failures."""
+    history = ci_attempts().get(ci_job_key(top, platform, job), {})
+    entries = history.values() if isinstance(history, dict) else []
+    entries = sorted((r for r in entries if isinstance(r, dict)), key=lambda r: r.get("t", 0))
+    failures = 0
+    explicit_slow = slow
+    for row in entries:
+        result = row.get("result")
+        if result == "success":
+            failures, slow = 0, False
+        elif result in ("failure", "cancelled"):
+            failures += 1
+        elif result == "slow":
+            slow = True
+    if platform != "macos" or (not failures and not (slow or explicit_slow)):
+        return "ci", "-", failures
+    if failures >= 2:
+        return "local", "bypass", failures
+    try:
+        load = os.getloadavg()[0]
+    except OSError:
+        return "wait", "16", failures
+    return ("local" if math.isfinite(load) and load <= 16 else "wait"), "16", failures
+
+
+def cmd_ci(a):
+    rows = registry()
+    if a.op == "list":
+        for k, v in sorted(rows.items()):
+            print("\t".join([k] + v))
+        return 0
+    if not a.dir:
+        print("load-watch ci check|rm|decide needs DIR", file=sys.stderr)
+        return 2
+    top = a.dir.rstrip("/") if a.dir.endswith("/*") else (git_top(a.dir) or os.path.realpath(a.dir))
+    if a.op in ("record", "route"):
+        if not a.job or not a.platform or (a.op == "record" and (not a.attempt or not a.result)):
+            print("load-watch ci record|route requires --job and --platform; record also --attempt and --result", file=sys.stderr)
+            return 2
+        if a.op == "record":
+            record_ci_attempt(top, a.platform, a.job, a.attempt, a.result)
+        else:
+            print("\t".join(map(str, ci_job_route(top, a.platform, a.job, a.slow))))
+        return 0
+    if a.op == "check":  # bg: "mode<TAB>text<TAB>key", exit 1 when undecided
+        key, row = decision(top, rows)
+        if row is None:
+            return 1
+        print(f"{row[0]}\t{row[1]}\t{key}")
+        return 0
+    if a.op == "decide":
+        if a.mode not in MODES or not a.text:
+            print('load-watch ci decide DIR ci "CI command"|local "why"|pending "note"', file=sys.stderr)
+            return 2
+        rows[top] = [a.mode, a.text, time.strftime("%Y-%m-%d")]
+    elif a.op == "rm":
+        if rows.pop(top, None) is None:
+            print(f"load-watch: {top} has no decision", file=sys.stderr)
+            return 1
+    write_registry(rows)
+    print(f"{a.op} {top}" + (f" {a.mode}" if a.op == "decide" else ""))
+    return 0
+
+
+def cmd_ci_only(a):
+    rows = registry()
+    if a.op == "list":
+        for k, v in sorted(rows.items()):
+            if v[0] == "ci":
+                print(f"{k}\t{v[1]}\t{v[2]}")
+        return 0
+    if not a.dir:
+        print("load-watch ci-only add|rm|check needs DIR", file=sys.stderr)
+        return 2
+    top = git_top(a.dir) or os.path.realpath(a.dir)
+    if a.op == "check":
+        if rows.get(top, [""])[0] == "ci":
+            print(rows[top][1])
+            return 0
+        return 1
+    if a.op == "add":
+        if not a.ci_cmd:
+            print("load-watch ci-only add DIR \"CI command\"", file=sys.stderr)
+            return 2
+        rows[top] = ["ci", a.ci_cmd, time.strftime("%Y-%m-%d")]
+    elif a.op == "rm":
+        if rows.pop(top, None) is None:
+            print(f"load-watch: {top} is not registered", file=sys.stderr)
+            return 1
+    write_registry(rows)
+    print(f"{a.op} {top}")
+    return 0
+
+
+ADMIT_PER_CORE = 1.5  # admit's own default base; `bg` passes its own (2.5 since 2026-11-01). LOAD_PER_CORE (4.0) is only the blame step
+ADMIT_FRESH_S = 120   # state.json older than this says nothing about the machine now
+
+
+def _env_float(name, default, lo=0.0):
+    """A finite number >= lo from the environment, else `default` (a typo must not crash the launchd sampler)."""
+    try:
+        v = float(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+    return v if math.isfinite(v) and v >= lo else default
+
+
+# Memory gate (operator 2026-10-23): load alone cannot tell a busy host from a thrashing one (the 2026-10-23
+# spike was load 42-74 with kern.memorystatus_level 37% and swap 86-92%, the same swap a calm hour shows).
+# What it did show was compressor churn. Calibrated 2026-10-23 from 215 ten-second samples (10:20-10:52):
+# load<10 p50 34k, 10-25 p50 49k, >=25 p50 80k and p90 108k pages/s; the calm tail read 11-22k. The limit was 60000.
+# 2026-11-01 (load watcher d8891c91, measured): a sustained load of 35-70 on this 8-core, 16 GB Mac was memory
+# starvation, not CPU: ~64 MB free, ~12k compressions+decompressions/s, ~1760 pageins/s, kernel_task 57% and sys
+# 25-39% of the CPU, 31+ live agent processes (omp 20, copilot 11, claude 8, agy 3). The 4.0 calm boost let a slice
+# start in every brief dip and each start pushed memory back over: an oscillation. So admit now fails toward
+# WAITING: a free-memory floor, a lower compressor limit (12k/s was already starving, 20000 is the line), a pageins
+# limit and a cap on live Paseo agents, all env-tunable; a reading that cannot be taken is said so, never guessed.
+ADMIT_CHURN_PAGES_S = _env_float("LW_MAX_COMPRESSOR_S", 20000.0, 1.0)
+# Churn over ADMIT_CHURN_PAGES_S refuses only with corroboration (djbclark 2026-11-02, after standing 30-65k churn with idle CPU
+# refused nearly every launch for hours): load per core above ADMIT_CHURN_THRASH_PER_CORE or pageins over their limit; churn above
+# ADMIT_CHURN_HARD_PAGES_S (the pre-2026-11-01 limit) refuses on its own.
+ADMIT_CHURN_THRASH_PER_CORE = _env_float("LW_CHURN_THRASH_PER_CORE", 1.5, 0.0)
+ADMIT_CHURN_HARD_PAGES_S = _env_float("LW_MAX_COMPRESSOR_HARD_S", 60000.0, 1.0)
+ADMIT_MIN_FREE_MB = _env_float("LW_MIN_FREE_MB", 300.0)  # djbclark 2026-11-01, with the available-memory measure (PR 230)
+ADMIT_PAGEINS_S = _env_float("LW_MAX_PAGEINS_S", 1000.0, 1.0)
+ADMIT_MAX_AGENTS = int(_env_float("LW_MAX_AGENTS", 14, 0))  # 0 = no cap
+ADMIT_MEM_WINDOW_S = 2.0  # vm_stat is read twice this far apart; the counters' deltas are the per-second rates
+# Calm boost (operator 2026-10-25, "make the change" after a load of 12-14 with no UI lag): while the compressor is
+# calm the per-core limit rises from ADMIT_PER_CORE to ADMIT_BOOST_PER_CORE. The signal is churn, not swap: swap sat
+# at 86-92% in calm hours too (above), so a swap condition would almost never boost. A churn that cannot be read
+# (no vm_stat) never boosts.
+# 2026-11-01 (operator): the boost limit rose from 2.0 to 4.0 per core. A load of 3.5 per core "is actually not too bad for
+# this system"; the real constraint on this 16 GB, 8-core Mac is memory pressure (compressor churn, swap) and process churn
+# (2026-10-31: five parallel pytest runs forked thousands of short git processes, load 222, swap 7.9/9.2 GB).
+# Same day, hysteresis: the boost applies only after the machine has been calm (churn at most the boost line, free
+# memory above the floor, pageins under their limit) for LW_BOOST_CALM_S (600) seconds without a break; any hot
+# reading, by `admit` or by the 20 s sampler, resets the clock (calm.json in the state dir). The boost line now
+# equals the compressor limit: churn between 20k and 25k used to boost and is now refused outright.
+ADMIT_BOOST_PER_CORE = 4.0
+ADMIT_BOOST_CHURN_PAGES_S = ADMIT_CHURN_PAGES_S
+ADMIT_BOOST_CALM_S = _env_float("LW_BOOST_CALM_S", 600.0)
+# Agent reservations (Codex review of PR 210, 2026-11-01): two dispatchers that both read 13 of 14 live agents and
+# spend 2 s sampling memory would both be admitted before either launches. An admission under the cap is therefore
+# recorded (agent-reservations.json under an flock, `{"r": [{"id", "until"}]}`) and counted with the live Paseo
+# agents until it is released or expires. The dispatcher releases it (`load-watch release ID`) the moment its agent
+# is spawned (the live count takes over; the entry then lives RELEASE_GRACE_S more, covering the seconds before
+# `paseo ls` shows the new agent) or the launch is refused; the expiry, LW_RESERVE_S (default 1200: it must outlast the
+# dispatcher's own pre-spawn capacity wait of up to 900 s), is only the backstop for a dispatcher that died.
+# LW_RESERVE_S=0 turns reservations off; `--no-reserve` makes one call a pure check.
+ADMIT_RESERVE_S = _env_float("LW_RESERVE_S", 1200.0)
+RELEASE_GRACE_S = 30.0
+CALM_GAP_S = ADMIT_FRESH_S  # calm.json's last reading older than this: nobody watched in between, the clock restarts
+EX_TEMPFAIL = 75
+
+
+def _fake_list(name):
+    raw = os.environ.get(name, "").strip()
+    return [float(x) for x in raw.split(",") if x.strip()] if raw else []
+
+
+def _fake_loads():
+    """LW_FAKE_LOAD1 (tests): one load, or a comma list read one per poll with the last value repeating."""
+    return _fake_list("LW_FAKE_LOAD1")
+
+
+def _fake_churn():
+    """LW_FAKE_CHURN (tests): pages/s, or a comma list read one per poll with the last value repeating."""
+    return _fake_list("LW_FAKE_CHURN")
+
+
+def _fake_memory():
+    """LW_FAKE_FREE_MB, LW_FAKE_PAGEINS, LW_FAKE_AGENTS (tests): each a number or a comma list, one per poll, last repeating."""
+    return {k: _fake_list(env) for k, env in (("free_mb", "LW_FAKE_FREE_MB"), ("pageins_s", "LW_FAKE_PAGEINS"),
+                                              ("agents", "LW_FAKE_AGENTS"))}
+
+
+class ReadFailed(Exception):
+    """A reading source that EXISTS on this host (vm_stat, /proc, ps) failed: timed out, exited non-zero or printed
+    something unparsable. That is likeliest exactly when the machine is starving (a fork+exec stalls), so `admit`
+    treats it as hot (refuses), never as open. A source that is absent altogether returns None instead."""
+
+
+def _vm_stat_snapshot():
+    """{free_mb, compress, pageins} from macOS `vm_stat`. free_mb is memory available WITHOUT compressing or swapping:
+    Pages free + File-backed pages + Pages purgeable. File-backed pages (file cache, speculative included) are dropped at no
+    cost, like Linux MemAvailable's file-LRU term; purgeable (volatile) pages are discarded rather than compressed. Inactive
+    pages are NOT counted: the inactive queue also holds anonymous memory, which can only be reclaimed by compressing or
+    swapping it (adversary F1 on PR 230: >= 968 MB of inactive pages were anonymous). A vm_stat without `File-backed pages`
+    falls back to free + speculative (conservative). Why not free + speculative alone: macOS keeps spare memory as file cache,
+    so that read 82 MB on an idle Mac on 2026-11-01 and the 600 MB floor refused every launch for ~1.5 h.
+    compress = Compressions + Decompressions, cumulative pages. None when there is no `vm_stat` binary; ReadFailed when it
+    exists and fails."""
+    try:
+        r = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5)
+    except FileNotFoundError:
+        return None
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise ReadFailed(f"vm_stat: {e!r}") from e
+    if r.returncode != 0:
+        raise ReadFailed(f"vm_stat exited {r.returncode}")
+    out = r.stdout
+    v = {m.group(1): int(m.group(2)) for m in
+         re.finditer(r"^(Pages free|Pages speculative|File-backed pages|Pages purgeable|Pageins|Compressions|Decompressions):\s+(\d+)",
+                     out, re.M)}
+    ps = re.search(r"page size of (\d+) bytes", out)
+    try:
+        page = int(ps.group(1)) if ps else (os.sysconf("SC_PAGE_SIZE") or 16384)
+    except (ValueError, OSError) as e:
+        raise ReadFailed(f"vm_stat page size: {e!r}") from e
+    if not all(k in v for k in ("Pages free", "Pageins", "Compressions", "Decompressions")):
+        raise ReadFailed("vm_stat output lacks a needed counter")
+    if "File-backed pages" in v:
+        avail = v["Pages free"] + v["File-backed pages"] + v.get("Pages purgeable", 0)
+    else:
+        avail = v["Pages free"] + v.get("Pages speculative", 0)
+    return {"free_mb": avail * page / 1048576,
+            "compress": v["Compressions"] + v["Decompressions"], "pageins": v["Pageins"]}
+
+
+def _proc_snapshot():
+    """The Linux equivalents (2026-11-01, uncalibrated: swap pages/s against a line set for the macOS compressor, so
+    that gate rarely trips there; pgmajfault counts faults): free = MemAvailable (else MemFree) in /proc/meminfo,
+    compress = pswpin + pswpout and pageins = pgmajfault in /proc/vmstat. None when /proc/meminfo does not exist;
+    ReadFailed when it exists and cannot be read or parsed."""
+    try:
+        meminfo = Path("/proc/meminfo").read_text()
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise ReadFailed(f"/proc/meminfo: {e!r}") from e
+    try:
+        mem = {m.group(1): int(m.group(2)) for m in re.finditer(r"^(MemAvailable|MemFree):\s+(\d+) kB", meminfo, re.M)}
+        vm = {m.group(1): int(m.group(2)) for m in re.finditer(r"^(pswpin|pswpout|pgmajfault) (\d+)",
+                                                               Path("/proc/vmstat").read_text(), re.M)}
+    except (OSError, ValueError) as e:
+        raise ReadFailed(f"/proc/vmstat: {e!r}") from e
+    free_kb = mem.get("MemAvailable", mem.get("MemFree"))
+    if free_kb is None or not all(k in vm for k in ("pswpin", "pswpout", "pgmajfault")):
+        raise ReadFailed("/proc counters missing")
+    return {"free_mb": free_kb / 1024, "compress": vm["pswpin"] + vm["pswpout"], "pageins": vm["pgmajfault"]}
+
+
+def vm_snapshot():
+    """One memory snapshot, or None when this host has neither vm_stat nor /proc/meminfo; ReadFailed when the
+    source it has fails."""
+    s = _vm_stat_snapshot()
+    return s if s is not None else _proc_snapshot()
+
+
+def _compressor_pages():
+    """Compressions + Decompressions (cumulative) for the sampler, or None where unreadable (it never refuses)."""
+    try:
+        s = vm_snapshot()
+    except ReadFailed:
+        return None
+    return s["compress"] if s else None
+
+
+LIVE_AGENT_STATUSES = frozenset({"running", "initializing"})  # admit --max-agents: same live set as the E6 shim
+
+
+def count_agents():
+    """Live Paseo agents machine-wide (`paseo ls -g --background --json`, status running or initializing).
+    Retired Wave 6 shim process names (see RETIRED_AGENT_NAMES) are never counted. None when there is no `paseo`
+    binary; ReadFailed when paseo fails, times out or prints something that is not a list of agents."""
+    cli = paseo_cli()
+    try:
+        r = subprocess.run([cli, *PASEO_LS], capture_output=True, text=True, timeout=30, env=paseo_env())
+    except FileNotFoundError:
+        return None
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise ReadFailed(f"paseo ls: {e!r}") from e
+    if r.returncode != 0:
+        raise ReadFailed(f"paseo ls exited {r.returncode}")
+    try:
+        rows = json.loads(r.stdout)
+    except (TypeError, ValueError) as e:
+        raise ReadFailed("paseo ls printed no JSON") from e
+    if not isinstance(rows, list):
+        raise ReadFailed("paseo ls printed no list of agents")
+    n = 0
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"]:
+            continue
+        # A row whose provider/name looks like a retired shim is still a Paseo agent if paseo listed it;
+        # process argv named acp-run/acp-dispatch never reaches this path.
+        if row.get("status") in LIVE_AGENT_STATUSES:
+            n += 1
+    return n
+
+
+def admit_memory(fake_load, fake_churn, fake_mem, polls, max_agents=0):
+    """One memory reading: {churn, free_mb, pageins_s, agents}, each None when it cannot be read (said so in the
+    record, never guessed). Real mode reads vm_stat twice ADMIT_MEM_WINDOW_S apart. Test hooks: tests that fake the
+    load (or any reading) get a healthy default for the readings they do not fake, so a busy host cannot change
+    their answer."""
+    def pick(vals, default):
+        return vals[min(polls, len(vals) - 1)] if vals else default
+
+    if fake_load or fake_churn or any(fake_mem.values()):
+        return {"churn": pick(fake_churn, 0.0), "free_mb": pick(fake_mem["free_mb"], 8192.0),
+                "pageins_s": pick(fake_mem["pageins_s"], 0.0), "agents": int(pick(fake_mem["agents"], 0)), "failed": set()}
+    m = {"churn": None, "free_mb": None, "pageins_s": None, "agents": None, "failed": set()}
+    if max_agents:  # the cap gates only callers that START agents; everyone else skips the paseo ls
+        try:
+            m["agents"] = count_agents()
+        except ReadFailed:
+            m["failed"].add("agents")
+    try:
+        a = vm_snapshot()
+        if a is not None:
+            t0 = time.monotonic()
+            time.sleep(ADMIT_MEM_WINDOW_S)
+            b = vm_snapshot()
+            if b is None:
+                raise ReadFailed("second vm sample missing")
+            dt = time.monotonic() - t0
+            dt = dt if dt > 0 else ADMIT_MEM_WINDOW_S
+            m.update(churn=max(0.0, (b["compress"] - a["compress"]) / dt), free_mb=b["free_mb"],
+                     pageins_s=max(0.0, (b["pageins"] - a["pageins"]) / dt))
+    except ReadFailed:
+        m["failed"].add("memory")
+    return m
+
+
+def admit_reading(fake, polls):
+    """(load1, cores, per_core) now; `fake` is _fake_loads() and `polls` how many reads came before."""
+    load1 = fake[min(polls, len(fake) - 1)] if fake else os.getloadavg()[0]
+    cores = os.cpu_count() or 1
+    return load1, cores, load1 / cores
+
+
+def admit_limit(base, churn, boost=ADMIT_BOOST_PER_CORE, boost_churn=ADMIT_BOOST_CHURN_PAGES_S):
+    """The per-core limit in force: `boost` (when above `base`) while the compressor churn is known and at most
+    `boost_churn`, else `base`. boost None or 0 disables it."""
+    if boost and boost > base and churn is not None and churn <= boost_churn:
+        return boost
+    return base
+
+
+def memory_calm(churn, free_mb, pageins_s, boost_churn=None, min_free=None, max_pageins=None):
+    """True when every memory reading is known and under its line (a reading that is None is never calm)."""
+    boost_churn = ADMIT_BOOST_CHURN_PAGES_S if boost_churn is None else boost_churn
+    min_free = ADMIT_MIN_FREE_MB if min_free is None else min_free
+    max_pageins = ADMIT_PAGEINS_S if max_pageins is None else max_pageins
+    return (churn is not None and free_mb is not None and pageins_s is not None
+            and churn <= boost_churn and free_mb >= min_free and pageins_s <= max_pageins)
+
+
+def calm_load():
+    try:
+        s = json.loads((STATE_DIR / "calm.json").read_text())
+        return s if isinstance(s, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def calm_note(t, calm):
+    """Record one reading in calm.json (atomic) and return calm_since: the time of the first reading of the current
+    unbroken calm run, or None. A hot reading clears it; so does a gap over CALM_GAP_S since the last reading
+    (nobody saw the machine in between, so calm was not observed). The read-modify-write holds an flock on a
+    sibling lock file, so a hot reading by one process is not overwritten by another's stale calm one."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        lock = open(STATE_DIR / "calm.lock", "a")
+    except OSError:
+        return None  # an unwritable state dir only means the boost never accrues: fail toward waiting
+    with lock:
+        try:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            locked = False
+        else:
+            locked = True
+        if not locked and calm:
+            return None  # a calm reading that cannot be serialized could restore a superseded run: toward waiting
+        s = calm_load()
+        since, last = s.get("calm_since"), s.get("last_t")
+        if _num(last) and t < last:
+            # an older observation arriving after a newer one (the sampler stamps before it reads, admit after): a calm
+            # one changes nothing and never moves last_t back; a hot one still clears the run
+            if calm:
+                return since if _num(since) else None
+            since, t = None, last
+        elif not calm:
+            since = None
+        elif not (_num(since) and _num(last) and 0 <= t - last <= CALM_GAP_S and since <= t):
+            since = t
+        try:
+            tmp = STATE_DIR / f"calm.json.tmp{os.getpid()}"
+            tmp.write_text(json.dumps({"calm_since": since, "last_t": t}))
+            tmp.replace(STATE_DIR / "calm.json")
+        except OSError:
+            return None
+    return since
+
+
+def _res_read():
+    try:
+        r = json.loads((STATE_DIR / "agent-reservations.json").read_text()).get("r", [])
+        return [x for x in r if isinstance(x, dict) and isinstance(x.get("id"), str) and _num(x.get("until"))]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def reservations_active(now_t=None):
+    """Number of unexpired agent reservations (an unlocked read: it only reports; `agent_reserve` decides)."""
+    now_t = now() if now_t is None else now_t
+    return sum(1 for x in _res_read() if x["until"] > now_t)
+
+
+def _res_locked(fn):
+    """Run fn() holding the exclusive flock on agent-reservations.lock; None when the lock cannot be taken."""
+    try:
+        import fcntl
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(STATE_DIR / "agent-reservations.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return fn()
+    except (ImportError, OSError):
+        return None
+
+
+def _res_write(rows):
+    tmp = STATE_DIR / f"agent-reservations.json.tmp{os.getpid()}"
+    tmp.write_text(json.dumps({"r": rows}))
+    tmp.replace(STATE_DIR / "agent-reservations.json")
+
+
+def agent_reserve(cap, live, ttl):
+    """Atomically admit one more agent: under an flock, count the live Paseo agents (`live`: a number, or a
+    callable re-read inside the lock) plus the unexpired reservations; at or above `cap` it refuses, else it records
+    a reservation. Returns (None, id) when reserved, else (refusal name, None): `agents`, `agents_unreadable` when
+    `paseo ls` fails, `agents_reserve_failed` when the state cannot be written or locked (fail toward waiting)."""
+    def work():
+        try:
+            n = live() if callable(live) else live
+        except ReadFailed:
+            return "agents_unreadable", None
+        t = now()
+        keep = [x for x in _res_read() if x["until"] > t]
+        if (n or 0) + len(keep) >= cap:
+            return "agents", None
+        rid = f"{os.getpid()}-{int(t * 1000)}-{random.randrange(1 << 32):08x}"
+        try:
+            _res_write(keep + [{"id": rid, "until": t + ttl}])
+        except OSError:
+            return "agents_reserve_failed", None
+        return None, rid
+
+    out = _res_locked(work)
+    return out if out is not None else ("agents_reserve_failed", None)
+
+
+def release_reservation(rid):
+    """Shorten reservation `rid` to RELEASE_GRACE_S from now (its agent is spawned, or the launch was refused): the live
+    count takes over, and the grace covers the seconds before `paseo ls` shows the new agent. True when it was found."""
+    def work():
+        t = now()
+        rows, hit = [], False
+        for x in _res_read():
+            if x["id"] == rid:
+                hit, x = True, {"id": rid, "until": min(x["until"], t + RELEASE_GRACE_S)}
+            if x["until"] > t:
+                rows.append(x)
+        try:
+            _res_write(rows)
+        except OSError:
+            return False
+        return hit
+
+    return bool(_res_locked(work))
+
+
+def renew_reservation(rid):
+    """Push reservation `rid` out to LW_RESERVE_S from now (never shortening it): a dispatcher that is still waiting for
+    capacity, or for its agent to become countable, keeps its place however long that takes. False when it is gone
+    (released or expired: a reservation that lapsed is not resurrected, the dispatcher is told so)."""
+    def work():
+        t = now()
+        rows, hit = [], False
+        for x in _res_read():
+            if x["until"] <= t:
+                continue
+            if x["id"] == rid:
+                hit, x = True, {"id": rid, "until": max(x["until"], t + ADMIT_RESERVE_S)}
+            rows.append(x)
+        try:
+            _res_write(rows)
+        except OSError:
+            return False
+        return hit
+
+    return bool(_res_locked(work))
+
+
+def cmd_renew(a):
+    ok = renew_reservation(a.id)
+    print(f"renewed {a.id}" if ok else f"no reservation {a.id}")
+    return 0 if ok else 1
+
+
+def cmd_release(a):
+    ok = release_reservation(a.id)
+    print(f"released {a.id}" if ok else f"no reservation {a.id}")
+    return 0 if ok else 1
+
+
+def admit_refusals(per_core, limit, m, lim):
+    """Names of the gates that refuse: load, compressor, free_mem, pageins, agents, and `memory_unreadable` /
+    `agents_unreadable` (vm_stat or ps exists but the read failed or timed out: that is likeliest exactly when the
+    machine is starving, so it refuses). A reading whose tool is absent altogether (None, no failure) never
+    refuses; it is reported as `unreadable`. The agent cap 0 is off."""
+    out = []
+    if per_core > limit:
+        out.append("load")
+    # Churn refuses only with corroboration (djbclark 2026-11-02): above the churn limit AND (load above THRASH_PER_CORE or
+    # pageins over their limit), or above the hard line on its own. Standing compressor pressure with idle CPU (30-65k for hours
+    # on 2026-11-02, load ~0.7-1.1/core) refused nearly every launch; real thrash still shows load or pageins with it.
+    if m["churn"] is not None and m["churn"] > lim["churn"]:
+        thrash = per_core > ADMIT_CHURN_THRASH_PER_CORE or (m["pageins_s"] is not None and m["pageins_s"] > lim["max_pageins"])
+        if thrash or m["churn"] > lim.get("churn_hard", max(ADMIT_CHURN_HARD_PAGES_S, lim["churn"])):
+            out.append("compressor")
+    if m["free_mb"] is not None and m["free_mb"] < lim["min_free_mb"]:
+        out.append("free_mem")
+    if m["pageins_s"] is not None and m["pageins_s"] > lim["max_pageins"]:
+        out.append("pageins")
+    if lim["max_agents"] and m["agents"] is not None and m["agents"] + m.get("reserved", 0) >= lim["max_agents"]:
+        out.append("agents")
+    if "memory" in m["failed"]:
+        out.append("memory_unreadable")
+    if "agents" in m["failed"] and lim["max_agents"]:
+        out.append("agents_unreadable")
+    out.extend(x for x in m.get("extra", []) if x not in out)  # refusals decided at the reservation step
+    return out
+
+
+def admit_record(load1, cores, per_core, limit, waited, m, lim, calm_for=None):
+    """The admit result fields; adds the watcher's streak and hot_for_s when its state.json is fresh."""
+    refused = admit_refusals(per_core, limit, m, lim)
+    rec = {"status": "hot" if refused else "ok", "load1": round(load1, 2),
+           "per_core": round(per_core, 2), "cores": cores, "max_per_core": limit, "waited_s": int(waited)}
+    if refused:
+        rec["refused"] = refused
+    if m["churn"] is not None:
+        rec["mem_churn_pages_s"] = int(m["churn"])
+        rec["max_mem_churn_pages_s"] = lim["churn"]
+    if m["free_mb"] is not None:
+        rec["free_mb"] = int(m["free_mb"])
+        rec["min_free_mb"] = lim["min_free_mb"]
+    if m["pageins_s"] is not None:
+        rec["pageins_s"] = int(m["pageins_s"])
+        rec["max_pageins_s"] = lim["max_pageins"]
+    if m["agents"] is not None:
+        rec["agents"] = m["agents"]
+        if m.get("reserved"):
+            rec["reserved"] = m["reserved"]
+    if m.get("reservation") and not refused:
+        rec["reservation"] = m["reservation"]
+    rec["max_agents"] = lim["max_agents"]
+    cap_on = bool(lim["max_agents"])
+    unreadable = [name for k, name in (("churn", "memory"), ("agents", "agents"))
+                  if m[k] is None and name not in m["failed"] and (k == "churn" or cap_on)]
+    if unreadable:
+        rec["unreadable"] = unreadable
+    if calm_for is not None:
+        rec["calm_for_s"] = int(calm_for)
+    rec.update(watcher_fields())
+    return rec
+
+
+def _num(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def watcher_fields():
+    """streak and hot_for_s from the watcher's state.json, only when it is a dict with numeric, fresh `t` and
+    `hot_since`; anything else (a list, a string time, a torn write) is "no state", never an error: a crash here
+    used to end a wait that had measured a hot machine."""
+    try:
+        st = load_state()
+        if not isinstance(st, dict) or not (_num(st.get("t")) and _num(st.get("hot_since"))):
+            return {}
+        if abs(now() - st["t"]) > ADMIT_FRESH_S:
+            return {}
+        streak = st.get("streak", 0)
+        return {"streak": int(streak) if _num(streak) else 0, "hot_for_s": int(max(0.0, now() - st["hot_since"]))}
+    except (AttributeError, TypeError, ValueError, OverflowError, RecursionError):
+        return {}
+
+
+def admit_line(rec):
+    line = f"admit {rec['status']} load1={rec['load1']:g} per_core={rec['per_core']:.2f} cores={rec['cores']}"
+    if "mem_churn_pages_s" in rec:
+        line += f" mem_churn={rec['mem_churn_pages_s']}"
+    if "free_mb" in rec:
+        line += f" free_mb={rec['free_mb']}"
+    if "pageins_s" in rec:
+        line += f" pageins={rec['pageins_s']}"
+    if "agents" in rec:
+        line += f" agents={rec['agents']}"
+    if "unreadable" in rec:
+        line += " unreadable=" + ",".join(rec["unreadable"]) + " (gate open: reading failed)"
+    if rec["status"] == "hot":
+        line += " refused=" + ",".join(rec["refused"])
+        if "load" in rec["refused"]:
+            line += f" max_per_core={rec['max_per_core']:g}"
+        if "compressor" in rec["refused"]:
+            line += f" max_mem_churn={rec['max_mem_churn_pages_s']:g}"
+        if "free_mem" in rec["refused"]:
+            line += f" min_free_mb={rec['min_free_mb']:g}"
+        if "pageins" in rec["refused"]:
+            line += f" max_pageins={rec['max_pageins_s']:g}"
+        if "agents" in rec["refused"]:
+            line += f" max_agents={rec['max_agents']}"
+    if rec.get("reservation"):
+        line += f" reservation={rec['reservation']} (release it: load-watch release {rec['reservation']}; --no-reserve to only check)"
+    if "hot_for_s" in rec:
+        line += f" streak={rec['streak']} hot_for_s={rec['hot_for_s']}"
+    if rec["waited_s"]:
+        line += f" waited_s={rec['waited_s']}"
+    return line
+
+
+_DW = None   # the deadline_wait module once self_deadline() imported it
+
+
+def dl_beat():
+    """Heartbeat of this waiter's own deadline from the poll loop (a no-op unless it registered one)."""
+    if _DW is not None:
+        _DW.beat()
+
+
+def self_deadline(a, poll):
+    """Register this `admit --wait`'s own deadline (bin/deadline_wait.py): the exit code of the supervised run, or None to wait in this
+    process (--no-deadline, nested under `deadline run`, this is the supervised copy, or the deadline tool could not run it)."""
+    global _DW
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import deadline_wait
+        _DW = deadline_wait
+        # class maximum 30 min (B9), or --wait when shorter, plus a margin; heartbeat: a poll plus the stagger sleep, never under 5 min
+        rc = deadline_wait.supervised(
+            "load-watch admit", deadline_wait.safe_name("admit-wait", os.getpid()), deadline_wait.budget_for(a.wait, 1800),
+            max(300.0, 4 * poll + 120), str(Path(__file__).resolve()), sys.argv[1:], opt_out=a.no_deadline)
+        if rc == 124:   # stopped by its deadline: the load never fell within the wait. Callers fail OPEN on an unknown exit, so answer 75
+            print("load-watch admit: the wait's deadline expired; answering 75 (still too hot, nothing admitted)", file=sys.stderr)
+            return EX_TEMPFAIL
+        return rc
+    except ImportError as e:
+        print(f"load-watch admit: warning: deadline_wait unavailable ({e}): waiting without a deadline", file=sys.stderr)
+        return None
+
+
+def cmd_admit(a):
+    """May new work start now? Only ever decides; never kills, throttles or signals anything."""
+    lim = {"churn": getattr(a, "max_mem_churn", ADMIT_CHURN_PAGES_S), "min_free_mb": getattr(a, "min_free_mb", ADMIT_MIN_FREE_MB),
+           "max_pageins": getattr(a, "max_pageins", ADMIT_PAGEINS_S), "max_agents": getattr(a, "max_agents", 0)}
+    if (not (math.isfinite(a.wait) and math.isfinite(a.max_per_core) and all(math.isfinite(v) for v in lim.values()))
+            or a.wait < 0 or a.max_per_core <= 0 or lim["churn"] <= 0 or lim["max_pageins"] <= 0
+            or lim["min_free_mb"] < 0 or lim["max_agents"] < 0):
+        print("load-watch admit: --wait must be a finite number, 0 or more, --max-per-core, --max-mem-churn and "
+              "--max-pageins finite and above 0, --min-free-mb and --max-agents 0 or more", file=sys.stderr)
+        return 2
+    try:
+        lo, hi = (float(x) for x in os.environ.get("LW_ADMIT_STAGGER_S", "5,30").split(","))
+        poll = float(os.environ.get("LW_ADMIT_POLL_S", "15"))
+        fake, fake_churn, fake_mem = _fake_loads(), _fake_churn(), _fake_memory()
+        if not (math.isfinite(lo) and math.isfinite(hi) and math.isfinite(poll) and 0 <= lo <= hi <= 60
+                and all(math.isfinite(x) for x in fake + fake_churn + sum(fake_mem.values(), []))):
+            raise ValueError("out of range")
+    except ValueError:
+        print("load-watch admit: bad LW_FAKE_LOAD1, LW_FAKE_CHURN, LW_FAKE_FREE_MB, LW_FAKE_PAGEINS, LW_FAKE_AGENTS, "
+              "LW_ADMIT_POLL_S or LW_ADMIT_STAGGER_S (finite, stagger 0 <= min <= max <= 60)", file=sys.stderr)
+        return 2
+    poll = max(1.0, poll)  # never a busy loop on a machine that is already hot
+    boost = getattr(a, "boost_per_core", ADMIT_BOOST_PER_CORE)
+    boost_churn = getattr(a, "boost_max_churn", ADMIT_BOOST_CHURN_PAGES_S)
+    if not (math.isfinite(boost) and math.isfinite(boost_churn)) or boost < 0 or boost_churn <= 0:
+        print("load-watch admit: --boost-per-core and --boost-max-churn must be finite (0 turns the boost off)",
+              file=sys.stderr)
+        return 2
+    if fake and not fake_churn:
+        boost = 0  # a faked load with no faked churn reads churn 0 (not a measurement): never boosts
+    measured = not fake or bool(fake_churn) or any(fake_mem.values())  # a defaulted fake reading is not an observation
+    reserve_on = bool(lim["max_agents"]) and ADMIT_RESERVE_S > 0 and not getattr(a, "no_reserve", False)  # records one
+
+    def read(polls):
+        load1, cores, per_core = admit_reading(fake, polls)
+        m = admit_memory(fake, fake_churn, fake_mem, polls, lim["max_agents"])
+        if lim["max_agents"]:
+            m["reserved"] = reservations_active() if ADMIT_RESERVE_S > 0 else 0   # counted whenever the cap is evaluated, reserving or not
+        calm_for = None
+        if measured:  # every real reading feeds the shared clock, boost or not (a hot one must reset it for everyone)
+            t = now()
+            # judged with the module defaults only: one caller's loose flags must not start the shared calm clock for others
+            since = calm_note(t, memory_calm(m["churn"], m["free_mb"], m["pageins_s"]))
+            if boost and boost > a.max_per_core:
+                calm_for = (t - since) if since is not None else None
+        # the boost needs an unbroken calm run of at least ADMIT_BOOST_CALM_S (churn None: no boost either)
+        limit = admit_limit(a.max_per_core, m["churn"] if calm_for is not None and calm_for >= ADMIT_BOOST_CALM_S else None,
+                            boost, boost_churn)
+        return load1, cores, per_core, m, limit, calm_for
+
+    if getattr(a, "supervise", False) and a.wait > 0:
+        rc = self_deadline(a, poll)
+        if rc is not None:
+            return rc
+    start, polls, next_note = time.monotonic(), 0, 60.0
+    while True:
+        load1, cores, per_core, m, limit, calm_for = read(polls)
+        polls += 1
+        waited = time.monotonic() - start
+        if not admit_refusals(per_core, limit, m, lim) and polls > 1:
+            # the load fell while we waited: stagger so queued dispatchers do not all start in the same second,
+            # then look again (someone else may have started in the meantime)
+            # (never past the --wait budget: deferred records and rearm timeouts only budget that much)
+            left = a.wait - waited
+            if left > 0:
+                time.sleep(min(random.uniform(lo, hi), left))
+            load1, cores, per_core, m, limit, calm_for = read(polls)
+            polls += 1
+            waited = time.monotonic() - start
+        refused = admit_refusals(per_core, limit, m, lim)
+        if not refused and reserve_on:
+            live = m["agents"] if (fake or fake_churn or any(fake_mem.values())) else count_agents
+            why, rid = agent_reserve(lim["max_agents"], live, ADMIT_RESERVE_S)
+            if why:
+                m["extra"] = [why]
+                refused = admit_refusals(per_core, limit, m, lim)
+            else:
+                m["reservation"] = rid
+        if not refused or waited >= a.wait:
+            break
+        if waited >= next_note:
+            print(f"load-watch admit: waiting, refused={','.join(refused)} load1={load1:g} per_core={per_core:.2f} (limit {limit:g})"
+                  + (f" mem_churn={m['churn']:.0f} (limit {lim['churn']:g})" if m["churn"] is not None else "")
+                  + (f" free_mb={m['free_mb']:.0f} (floor {lim['min_free_mb']:g})" if m["free_mb"] is not None else "")
+                  + (f" pageins={m['pageins_s']:.0f} (limit {lim['max_pageins']:g})" if m["pageins_s"] is not None else "")
+                  + (f" agents={m['agents']} (cap {lim['max_agents']})" if m["agents"] is not None else "")
+                  + f", {int(waited)}s of {a.wait:g}s", file=sys.stderr)
+            next_note += 60.0
+        dl_beat()
+        time.sleep(max(0.0, min(poll, a.wait - waited)))
+    rec = admit_record(load1, cores, per_core, limit, waited, m, lim, calm_for)
+    print(json.dumps(rec) if a.json else admit_line(rec))
+    return 0 if rec["status"] == "ok" else EX_TEMPFAIL
+
+
+def cmd_install(a):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import ade_sched
+    over = {}
+    if os.environ.get("LW_LAUNCH_AGENTS"):   # kept for older callers; ADE_SCHED_LAUNCH_AGENTS is the shared one
+        over["agents_dir"] = os.environ["LW_LAUNCH_AGENTS"]
+    try:
+        if a.cmd == "uninstall":
+            ade_sched.uninstall(LABEL, a.backend, dry_run=a.dry_run, ade=getattr(a, "ade", None), **over)
+            return 0
+        if not a.dry_run:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+        job = ade_sched.Job.from_plist(PLIST, ade=a.ade)
+        ade_sched.install(job, a.backend, dry_run=a.dry_run, allow_no_linger=a.allow_no_linger, **over)
+        return 0
+    except ade_sched.SchedError as e:
+        hint = " (use the systemd backend: cron cannot run every 20 s)" if e.code == 69 and "cron" in str(e) and "20" in str(e) else ""
+        print(f"load-watch {a.cmd}: {e}{hint}", file=sys.stderr)
+        return e.code
+
+
+def main(supervise=False):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+    p = sub.add_parser("sample")
+    p.add_argument("--dry-run", action="store_true", help="attribute and print; no brief, paseo send, ping or cooldown")
+    p.add_argument("-v", "--verbose", action="store_true")
+    sub.add_parser("status")
+    p = sub.add_parser("incidents")
+    p.add_argument("-n", type=int, default=20)
+    p = sub.add_parser("ack")
+    p.add_argument("id")
+    p.add_argument("note")
+    p = sub.add_parser("ci-only")
+    p.add_argument("op", choices=["list", "add", "rm", "check"])
+    p.add_argument("dir", nargs="?")
+    p.add_argument("ci_cmd", nargs="?", metavar="CMD")
+    p = sub.add_parser("guard")
+    p.add_argument("op", choices=["status", "list", "add", "rm", "reset"])
+    p.add_argument("label", nargs="?")
+    p.add_argument("limits", nargs="*", metavar="KEY=VALUE")
+    p.add_argument("--note")
+    p = sub.add_parser("ci")
+    p.add_argument("op", choices=["list", "check", "decide", "rm", "record", "route"])
+    p.add_argument("dir", nargs="?")
+    p.add_argument("mode", nargs="?", choices=MODES)
+    p.add_argument("text", nargs="?", metavar="CMD_OR_REASON")
+    p.add_argument("--job", help="stable job name, shared with bg's BG_CI_JOB")
+    p.add_argument("--platform", choices=["macos", "linux", "other"], help="job target platform")
+    p.add_argument("--attempt", help="unique CI run/job id; recording it twice does not count twice")
+    p.add_argument("--result", choices=["failure", "cancelled", "success", "slow"])
+    p.add_argument("--slow", action="store_true", help="this macOS job is especially slow on CI")
+    p = sub.add_parser("renew")
+    p.add_argument("id", metavar="RESERVATION", help="extend an agent reservation by LW_RESERVE_S from now")
+    p = sub.add_parser("release")
+    p.add_argument("id", metavar="RESERVATION", help="the `reservation` id an `admit --max-agents --json` printed")
+    p = sub.add_parser("admit")
+    p.add_argument("--max-per-core", type=float, default=ADMIT_PER_CORE, metavar="N",
+                   help=f"admit when 1-minute load per core is at most N (default {ADMIT_PER_CORE:g})")
+    p.add_argument("--max-mem-churn", type=float, default=ADMIT_CHURN_PAGES_S, metavar="N",
+                   help=f"and compressor churn (pages compressed + decompressed per second, sampled over ~{ADMIT_MEM_WINDOW_S:g} s) "
+                        f"is at most N (default {ADMIT_CHURN_PAGES_S:g}, env LW_MAX_COMPRESSOR_S; was 60000 until 2026-11-01)")
+    p.add_argument("--min-free-mb", type=float, default=ADMIT_MIN_FREE_MB, metavar="N",
+                   help=f"and available memory (free + file-backed + purgeable pages on macOS, MemAvailable on Linux) is at least N MB (default {ADMIT_MIN_FREE_MB:g}, env LW_MIN_FREE_MB)")
+    p.add_argument("--max-pageins", type=float, default=ADMIT_PAGEINS_S, metavar="N",
+                   help=f"and pageins per second are at most N (default {ADMIT_PAGEINS_S:g}, env LW_MAX_PAGEINS_S)")
+    p.add_argument("--max-agents", type=int, nargs="?", const=ADMIT_MAX_AGENTS, default=0, metavar="N",
+                   help=f"and fewer than N live Paseo agents (`paseo ls -g --background --json`, status running or "
+                        f"initializing) are alive machine-wide. OFF unless given (0 = off), because only a caller that "
+                        f"STARTS agents may be gated by it; `bg` test runs must never be. "
+                        f"Bare `--max-agents` means {ADMIT_MAX_AGENTS} (env LW_MAX_AGENTS; 0 there = off)")
+    p.add_argument("--no-reserve", action="store_true",
+                   help=f"with --max-agents, do not record a reservation for an admission (a pure check); otherwise an "
+                        f"admission counts as one agent for LW_RESERVE_S ({ADMIT_RESERVE_S:g}) seconds, so concurrent "
+                        f"dispatchers cannot all be admitted under the cap")
+    p.add_argument("--boost-per-core", type=float, default=ADMIT_BOOST_PER_CORE, metavar="N",
+                   help=f"while churn is at most --boost-max-churn, admit up to N per core instead "
+                        f"(default {ADMIT_BOOST_PER_CORE:g}; 0 turns the boost off)")
+    p.add_argument("--boost-max-churn", type=float, default=ADMIT_BOOST_CHURN_PAGES_S, metavar="N",
+                   help=f"the churn (pages/s) up to which the boost applies (default {ADMIT_BOOST_CHURN_PAGES_S:g})")
+    p.add_argument("--wait", type=float, default=0, metavar="SECONDS",
+                   help="poll every 15 s for up to SECONDS before giving up with exit 75 (0: a pure check)")
+    p.add_argument("--no-deadline", action="store_true",
+                   help="with --wait: do not register the wait with bin/deadline (default: admit-wait-<pid>, budget min(--wait, 30 min) + 60 s, "
+                        "owner $PASEO_AGENT_ID, heartbeat per poll; on expiry the waiter's own process group is killed and admit answers 75)")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("watcher", help="the one Paseo agent that hears about every spike")
+    p.add_argument("op", choices=["set", "show", "clear", "test"])
+    p.add_argument("target", nargs="?", help="clear: only if it is this target; test: the text to send")
+    p.add_argument("--paseo", metavar="AGENT_ID", help="set: a Paseo agent (default: $PASEO_AGENT_ID)")
+    p.add_argument("--name", help="set: a label for the session")
+    p.add_argument("--cwd", help="set: the session's directory (default: the current one)")
+    p.add_argument("--chain", help="set: its session-handoff chain, for /baton")
+    p.add_argument("--json", action="store_true", help="show: the record as JSON")
+    for name in ("install", "uninstall"):
+        p = sub.add_parser(name)
+        p.add_argument("--backend", choices=["auto", "launchd", "systemd", "cron"], default=None,
+                       help="scheduler (default auto: launchd on macOS, systemd user timer on Linux; cron cannot run every 20 s)")
+        p.add_argument("--dry-run", action="store_true", help="print what would be written and run; change nothing")
+        if name == "install":
+            p.add_argument("--ade", metavar="DIR", help="the checkout the job runs from (required from a linked worktree)")
+            p.add_argument("--allow-no-linger", action="store_true", help="systemd: install although Linger=no")
+    a = ap.parse_args()
+    a.supervise = supervise   # set only by the command line: a test calling cmd_admit() in-process never starts a supervised copy
+    if a.cmd is None:
+        ap.print_usage(sys.stderr)
+        return 2
+    return {"sample": cmd_sample, "status": cmd_status, "incidents": cmd_incidents, "ack": cmd_ack,
+            "guard": cmd_guard, "watcher": cmd_watcher, "admit": cmd_admit, "release": cmd_release, "renew": cmd_renew, "ci": cmd_ci, "ci-only": cmd_ci_only, "install": cmd_install, "uninstall": cmd_install}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main(supervise=True))

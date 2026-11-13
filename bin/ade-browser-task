@@ -1,0 +1,319 @@
+#!/usr/bin/env -S python3 -I
+"""ade-browser-task: render / relay browser-only prompts (setup-plan S7).
+
+  ade-browser-task list [--root DIR] [--json]
+  ade-browser-task render TASK [--root DIR] [--owner O] [--repo R] [--json]
+  ade-browser-task relay TASK [--root DIR] [--owner O] [--repo R]
+                              [--dry-run|--send] [--json]
+  ade-browser-task track TASK --name NAME --deadline-seconds N
+                         --notify-owner ID [--owner O --repo R] [--app-name APP]
+                         [--dry-run|--yes] [--root DIR] [--state-dir DIR] [--json]
+  ade-browser-task status NAME [--state-dir DIR] [--json]
+  ade-browser-task verify NAME [--dry-run] [--state-dir DIR] [--json]
+  ade-browser-task poll NAME [--interval-seconds N] [--max-wait-seconds N]
+                      [--dry-run] [--state-dir DIR] [--json]
+
+List and render checked-in templates under prompts/browser/. Relay uses
+coding-bot ask when available; otherwise prints a self-contained prompt and
+reports unsent. Default relay mode is --dry-run (no send). A send proves
+neither completion nor the setting. Secrets and access-widening tasks are
+refused. track/verify/poll support pr-access, issue-access and
+github-app-create; completion is proven only by the authoritative GET
+readback. poll is a bounded foreground loop, not a scheduler. See
+docs/browser-task.md.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+# New plan/status commands must remain cold-cache read-only too.
+if any(command in sys.argv[1:] for command in ("track", "status", "verify", "poll")):
+    sys.dont_write_bytecode = True
+
+BIN = Path(__file__).resolve().parent
+if str(BIN) not in sys.path:
+    sys.path.insert(0, str(BIN))
+
+import ade_browser_task as abt  # noqa: E402
+
+
+def _print_json(obj: object) -> None:
+    json.dump(obj, sys.stdout, indent=2, sort_keys=True, default=str)
+    sys.stdout.write("\n")
+
+
+def _root(args: argparse.Namespace) -> Path:
+    root = getattr(args, "root", None)
+    return Path(root) if root else abt.repo_root_from_here()
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    root = _root(args)
+    prompts = abt.default_prompts_dir(root)
+    try:
+        templates = abt.list_templates(prompts)
+    except abt.BrowserTaskError as e:
+        if args.json:
+            _print_json({"ok": False, "errors": [str(e)]})
+        else:
+            print(str(e), file=sys.stderr)
+        return 1
+    rows = [abt.template_summary(t) for t in templates]
+    if args.json:
+        _print_json({"ok": True, "prompts_dir": str(prompts), "tasks": rows})
+        return 0
+    print(f"ade-browser-task list: {len(rows)} task(s) in {prompts}")
+    for row in rows:
+        title = row.get("title") or ""
+        url = row.get("url") or ""
+        extra = f"  {title}" if title else ""
+        if url:
+            extra += f"  url={url}"
+        print(f"  {row['id']}{extra}")
+    return 0
+
+
+def cmd_render(args: argparse.Namespace) -> int:
+    root = _root(args)
+    try:
+        rendered = abt.render_task(
+            root,
+            args.task,
+            owner=args.owner,
+            repo=args.repo,
+        )
+    except abt.BrowserTaskError as e:
+        if args.json:
+            _print_json({"ok": False, "errors": [str(e)]})
+        else:
+            print(str(e), file=sys.stderr)
+            print("ade-browser-task render: FAIL", file=sys.stderr)
+        return 1
+    if args.json:
+        _print_json({"ok": True, **abt.rendered_payload(rendered)})
+        return 0
+    if rendered.url:
+        print(f"# url: {rendered.url}", file=sys.stderr)
+    sys.stdout.write(rendered.text)
+    return 0
+
+
+def cmd_relay(args: argparse.Namespace) -> int:
+    root = _root(args)
+    dry_run = not args.send
+    try:
+        rendered = abt.render_task(
+            root,
+            args.task,
+            owner=args.owner,
+            repo=args.repo,
+        )
+        result = abt.relay_task(rendered, dry_run=dry_run)
+    except abt.BrowserTaskError as e:
+        if args.json:
+            _print_json({"ok": False, "errors": [str(e)]})
+        else:
+            print(str(e), file=sys.stderr)
+            print("ade-browser-task relay: FAIL", file=sys.stderr)
+        return 1
+    payload = abt.relay_payload(result)
+    # unsent / dry-run still exit 0: the operator can paste; sent also 0.
+    if args.json:
+        _print_json({"ok": True, "url": rendered.url, **payload})
+        return 0
+    print(f"ade-browser-task relay: status={result.status}")
+    print(f"  task={result.task_id}")
+    if rendered.url:
+        print(f"  url={rendered.url}")
+    if result.coding_bot:
+        print(f"  coding_bot={result.coding_bot}")
+    print(f"  detail={result.detail}")
+    if result.prompt:
+        print("--- prompt ---")
+        sys.stdout.write(result.prompt)
+        if not result.prompt.endswith("\n"):
+            sys.stdout.write("\n")
+        print("--- end ---")
+    return 0
+
+
+def _print_lifecycle(command: str, payload: dict, json_output: bool) -> None:
+    if json_output:
+        _print_json(payload)
+    else:
+        print("ade-browser-task " + command + ": " + str(payload["status"]))
+        print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def cmd_lifecycle(args: argparse.Namespace) -> int:
+    import ade_browser_task_state as state
+
+    try:
+        state.validate_name(args.name)
+        directory = Path(args.state_dir).expanduser() if args.state_dir else None
+        if args.cmd == "track":
+            # Resolve owner/repo with the same transitional source as render.
+            if args.owner is not None:
+                abt.validate_owner_repo(args.owner, kind="owner")
+            if args.repo is not None:
+                abt.validate_owner_repo(args.repo, kind="repo")
+            # Validate all IDs before reading configuration/templates.
+            if args.task not in state.SUPPORTED_TASKS:
+                raise abt.BrowserTaskError(
+                    "track supports: " + ", ".join(state.SUPPORTED_TASKS)
+                )
+            app_name = getattr(args, "app_name", None)
+            if args.task == "github-app-create" and app_name is not None:
+                state.validate_app_name(app_name)
+            if not state.NOTIFY_OWNER.fullmatch(args.notify_owner):
+                raise abt.BrowserTaskError("invalid notify-owner ID")
+            if not 1 <= args.deadline_seconds <= 86400:
+                raise abt.BrowserTaskError("deadline-seconds must be between 1 and 86400")
+            variables = abt.build_vars(root=_root(args), owner=args.owner, repo=args.repo)
+            if not variables.get("owner") or not variables.get("repo"):
+                raise abt.BrowserTaskError("track needs --owner/--repo or config/github.toml")
+            payload, rc = state.track(root=_root(args), task_id=args.task, name=args.name,
+                                      seconds=args.deadline_seconds, notify_owner=args.notify_owner,
+                                      owner=variables["owner"], repo=variables["repo"],
+                                      directory=directory, yes=args.yes, app_name=app_name)
+        elif args.cmd == "status":
+            payload = state.status(args.name, directory=directory)
+            rc = 0
+        else:
+            payload, rc = state.verify(args.name, directory=directory, dry_run=args.dry_run)
+    except (abt.BrowserTaskError, OSError) as error:
+        payload, rc = {"status": "error", "completed": False, "reason": str(error)}, 1
+    _print_lifecycle(args.cmd, payload, args.json)
+    return rc
+
+
+def cmd_poll(args: argparse.Namespace) -> int:
+    import ade_browser_task_state as state
+
+    try:
+        state.validate_name(args.name)
+        directory = Path(args.state_dir).expanduser() if args.state_dir else None
+        payload, rc = state.poll(args.name, directory=directory,
+                                 interval_seconds=args.interval_seconds,
+                                 max_wait_seconds=args.max_wait_seconds,
+                                 dry_run=args.dry_run)
+    except (abt.BrowserTaskError, OSError) as error:
+        payload, rc = {"status": "error", "completed": False, "reason": str(error)}, 1
+    _print_lifecycle("poll", payload, args.json)
+    return rc
+
+
+def build_parser() -> argparse.ArgumentParser:
+    # Shared --root on top-level and each subparser (ade-install / ade-github-setup):
+    # just recipes and docs put --root after the subcommand; help also accepts before.
+    shared = argparse.ArgumentParser(add_help=False)
+    shared.add_argument(
+        "--root",
+        default=argparse.SUPPRESS,
+        help="repository root; before/after command, last explicit wins",
+    )
+    p = argparse.ArgumentParser(
+        prog="ade-browser-task",
+        description=(
+            "Render/relay browser-only prompts from prompts/browser/ "
+            "(setup-plan S7; no live browser required)."
+        ),
+        parents=[shared],
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    p_list = sub.add_parser(
+        "list", parents=[shared], help="list checked-in browser tasks"
+    )
+    p_list.add_argument("--json", action="store_true")
+    p_list.set_defaults(func=cmd_list)
+
+    p_render = sub.add_parser(
+        "render", parents=[shared], help="render one task prompt to stdout"
+    )
+    p_render.add_argument("task", help="task id (prompts/browser/<task>.md)")
+    p_render.add_argument("--owner", help="GitHub owner (default: config/github.toml)")
+    p_render.add_argument("--repo", help="GitHub repository name")
+    p_render.add_argument("--json", action="store_true")
+    p_render.set_defaults(func=cmd_render)
+
+    p_relay = sub.add_parser(
+        "relay",
+        parents=[shared],
+        help="relay a rendered prompt (default --dry-run; --send uses coding-bot ask)",
+    )
+    p_relay.add_argument("task", help="task id (prompts/browser/<task>.md)")
+    p_relay.add_argument("--owner", help="GitHub owner (default: config/github.toml)")
+    p_relay.add_argument("--repo", help="GitHub repository name")
+    mode = p_relay.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--send",
+        action="store_true",
+        help="call coding-bot ask when available; else print unsent (default: dry-run)",
+    )
+    mode.add_argument(
+        "--dry-run",
+        dest="dry_run_flag",
+        action="store_true",
+        help="print the prompt; do not call coding-bot (default; exclusive with --send)",
+    )
+    p_relay.add_argument("--json", action="store_true")
+    p_relay.set_defaults(func=cmd_relay, send=False, dry_run_flag=False)
+
+    p_track = sub.add_parser("track", parents=[shared], help="opt-in task record and deadline; default plan only")
+    p_track.add_argument("task")
+    p_track.add_argument("--name", required=True)
+    p_track.add_argument("--deadline-seconds", type=int, required=True)
+    p_track.add_argument("--notify-owner", required=True, help="deadline notification recipient ID")
+    p_track.add_argument("--owner", help="GitHub owner")
+    p_track.add_argument("--repo", help="GitHub repository")
+    p_track.add_argument("--app-name", help="GitHub App slug for github-app-create (default ade-merge-gate)")
+    mode = p_track.add_mutually_exclusive_group()
+    mode.add_argument("--yes", action="store_true", help="create record and register notify deadline; never sends browser prompt")
+    mode.add_argument("--dry-run", action="store_true", help="plan only (default)")
+    p_track.set_defaults(func=cmd_lifecycle)
+    for command in ("status", "verify"):
+        lifecycle = sub.add_parser(command, help="read local task state" if command == "status" else "GET API readback and persist completion proof")
+        lifecycle.add_argument("name")
+        lifecycle.set_defaults(func=cmd_lifecycle)
+        if command == "verify":
+            lifecycle.add_argument("--dry-run", action="store_true", help="show GET argv only; no subprocess or state writes")
+    for lifecycle in (p_track, sub.choices["status"], sub.choices["verify"]):
+        lifecycle.add_argument("--state-dir", help="task record directory (default ~/.local/state/ade/browser-tasks)")
+        lifecycle.add_argument("--json", action="store_true")
+
+    p_poll = sub.add_parser(
+        "poll", parents=[shared],
+        help="bounded automatic verify loop until completed/expired; --dry-run plans only",
+    )
+    p_poll.add_argument("name")
+    p_poll.add_argument("--interval-seconds", type=int, default=60,
+                        help="seconds between readbacks (5-3600, default 60)")
+    p_poll.add_argument("--max-wait-seconds", type=int, default=3600,
+                        help="total foreground wait cap (1-86400, default 3600)")
+    p_poll.add_argument("--dry-run", action="store_true", help="plan only: no reads' side effects, network or sleeps")
+    p_poll.add_argument("--state-dir", help="task record directory (default ~/.local/state/ade/browser-tasks)")
+    p_poll.add_argument("--json", action="store_true")
+    p_poll.set_defaults(func=cmd_poll)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    try:
+        abt.refuse_secret_argv(argv)
+    except abt.BrowserTaskError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    args.root = getattr(args, "root", None)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

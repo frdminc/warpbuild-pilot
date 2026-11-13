@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- bin/ade-progress, subcommand scan with the yes flag, every 5 minutes: a zero-token host script (no model prompt), one `paseo ls` plus an
+     inspect per enrolled agent. Inventoried in config/install.toml as `ade-progress` (slice 1b, 2026-11-12; class optional, chosen = true since 2026-11-13;
+     install command in docs/scheduling.md). Not loaded by merging this file. `bin/ade-sched` fills __ADE__ and __HOME__. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.djbclark.ade-progress</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__ADE__/bin/ade-job-run</string><string>--lock-dir</string><string>__ADMISSION__</string><string>com.djbclark.ade-progress</string><string>--</string>
+    <string>__ADE__/bin/ade-progress</string>
+    <string>scan</string>
+    <string>--yes</string>
+  </array>
+  <key>StartInterval</key><integer>300</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StandardOutPath</key><string>__HOME__/.local/state/djbclark-ade/progress/scan.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/.local/state/djbclark-ade/progress/scan.log</string>
+</dict>
+</plist>

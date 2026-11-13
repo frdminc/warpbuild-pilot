@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# opencode-plugin-guard — Archive (Pi-only 2026-11-08): keep the tool-managed OpenCode plugin (rtk) at the v2
+# module shape; OpenCode is not a live TUI.
+#
+# Why: rtk writes its plugin file from an embedded template that is still the
+# v1 shape (a bare exported function), which OpenCode 2 rejects at load.
+# `rtk init -g --opencode` therefore silently reverts a working plugin. The
+# canonical copy here is the patched file; this guard restores it only when
+# the v2 shape is missing, or migrates the exact known unsafe RTK shim.
+#
+#   opencode-plugin-guard --check   report only, change nothing
+#   opencode-plugin-guard           restore what is missing (default)
+#
+# Also: `opencode-plugin-guard` patches Paseo's paseo-managed-bridge stale-binding check
+# (on demand, when the OpenCode model list in Paseo is blank; see handle_paseo_bridge).
+#
+# Idempotent and non-destructive: a live file that already has the v2 shape and
+# differs from the canonical copy is left alone. Unknown RTK copies are flagged
+# for review; a v2 export alone does not prove permission safety. See djbclark-ade/docs/opencode-plugin-v2.md.
+#
+# Exit codes: 0 ok / nothing to do; 1 something was restored or needs attention.
+
+export PATH="/opt/homebrew/bin:$PATH"
+set -euo pipefail
+
+CANONICAL_DIR="${OPENCODE_PLUGIN_GUARD_CANONICAL:-$HOME/src/djbclark-ade/opencode-plugins}"
+CONFIG_DIR="${OPENCODE_CONFIG_DIR:-$HOME/.config/opencode}"
+LIVE_DIR="$CONFIG_DIR/plugins"
+STATE_DIR="$HOME/.local/state/opencode-plugin-guard"
+CHECK=0
+[ "${1:-}" = "--check" ] && CHECK=1
+
+mkdir -p "$STATE_DIR"
+rc=0
+log() { printf '%s\n' "$*"; }
+
+# has_v2 <file> — OpenCode 2 accepts a default export object with an id plus an
+# effect or setup function (which may be a bare reference in the object literal
+# and declared as `function setup`/`const setup` above it).
+has_v2() {
+  local f="$1"
+  [ -f "$f" ] || return 1
+  ggrep -qE 'export default \{[[:space:]]*id:' "$f" 2>/dev/null || return 1
+  ggrep -qE '(^|[^[:alnum:]_])(setup|effect)([^[:alnum:]_]|$)' "$f" 2>/dev/null
+}
+
+sha() { python3 -c 'import hashlib,pathlib,sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest()[:12])' "$1"; }
+
+# Our former managed V2 shim is unsafe even when supplied as canonical input.
+is_known_unsafe_rtk() {
+  python3 - "$1" <<'PYHASH'
+import hashlib, pathlib, sys
+known = "8e46510ecdc95d4268838e435d33752d179675a6005b8de2483c7355b5d7da44"
+sys.exit(0 if hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest() == known else 1)
+PYHASH
+}
+
+# upstream_or_drift <name> <live> <canonical> — v2 present but not our bytes.
+upstream_or_drift() {
+  local name="$1" live="$2" canonical="$3"
+  if cmp -s "$live" "$canonical"; then
+    log "  $name: v2 present, identical to the canonical copy"
+    return
+  fi
+  log "  $name: v2 shape present but differs from the canonical copy"
+  # A newer still-v1 template rewritten by us would look like drift only in the
+  # version comment; flag it rather than silently restoring an old base.
+  local live_ver canon_ver
+  live_ver="$(ggrep -o 'opencode-integration-version: [0-9.]*' "$live" 2>/dev/null | ghead -1 || true)"
+  canon_ver="$(ggrep -o 'opencode-integration-version: [0-9.]*' "$canonical" 2>/dev/null | ghead -1 || true)"
+  if [ -n "$live_ver" ] && [ -n "$canon_ver" ] && [ "$live_ver" != "$canon_ver" ]; then
+    log "    WARNING: canonical drift — live says '$live_ver', canonical '$canon_ver'."
+    log "    Refresh $CANONICAL_DIR/$(basename "$canonical") and re-run."
+    rc=1
+    return
+  fi
+  log "    -> treating as upstream v2 (or a local edit); not touching it"
+  gdate -u '+%Y-%m-%dT%H:%M:%SZ' >>"$STATE_DIR/upstream-v2-$name"
+}
+
+handle() {
+  local name="$1" file="$2" canonical="$3"
+  if [ ! -f "$canonical" ]; then
+    log "  $name: no canonical copy at $canonical — skipping"
+    return
+  fi
+  if [ "$name" = rtk ] && is_known_unsafe_rtk "$canonical"; then
+    log "  rtk: canonical $canonical is the known unsafe shim; refresh it; no write"
+    rc=1
+    return
+  fi
+  if [ -L "$file" ] && [ ! -e "$file" ]; then
+    log "  $name: dangling or cyclic plugin symlink preserved; review its target; no write"
+    rc=1
+    return
+  fi
+  if [ -e "$file" ] && [ ! -f "$file" ]; then
+    log "  $name: non-regular plugin entry preserved; review it; no write"
+    rc=1
+    return
+  fi
+  local unsafe_rtk=0
+  if [ "$name" = rtk ] && [ -f "$file" ] && is_known_unsafe_rtk "$file"; then
+    # Only our exact former managed copy is automatically migrated. Preserve
+    # custom/upstream code for review; pending requests never prove it safe.
+    unsafe_rtk=1
+  fi
+  if [ "$unsafe_rtk" = 1 ]; then
+    log "  rtk: known unsafe automatic rewrite shim; migrate to disabled entrypoints"
+  elif has_v2 "$file"; then
+    if [ "$name" = rtk ] && ! cmp -s "$file" "$canonical"; then
+      log "  rtk: unknown v2 copy preserved; permission safety needs review"
+      rc=1
+    else
+      upstream_or_drift "$name" "$file" "$canonical"
+    fi
+    return
+  else
+    log "  $name: v2 shape MISSING in $file"
+  fi
+  if [ "$CHECK" = 1 ]; then
+    log "    would restore from $canonical"
+    rc=1
+    return
+  fi
+  file="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$file")"
+  mkdir -p "$(dirname "$file")"
+  local tmp="$file.new.$$"
+  cp "$canonical" "$tmp"
+  chmod 0644 "$tmp"
+  mv -f "$tmp" "$file" # atomic replace; OpenCode's watcher reloads it
+  log "    restored $(basename "$file") from canonical (sha $(sha "$file"))"
+  rc=1
+}
+
+# handle_paseo_bridge — Paseo's `paseo-managed-bridge` plugin never drops a stale
+# session binding when OpenCode's Bun runtime (1.4.4) reports a refused connection
+# as `error.code === "ECONNREFUSED"` (no `cause`): every later bind answers HTTP 500
+# and Paseo's OpenCode model list stays blank (2026-11-04; upstream getpaseo/paseo#8780).
+# One exact-string patch of the live file; it goes away once Paseo ships the fix
+# (the vulnerable line disappears and this reports "not present"). OpenCode's file
+# watcher reloads the plugin without a restart; the in-memory bindings are kept
+# across reloads, and the patched handler then clears the stale one on the next
+# bind (Paseo retries every ~4 s). THE PATCH IS TRANSIENT: Paseo rewrote the file
+# from its runtime copy within a minute (2026-11-04 06:37), which is fine, since
+# the patched handler only has to run until one bind has cleared the stale binding.
+# Run this when the OpenCode model list is blank, then check
+# `paseo provider models opencode`; it is no standing guard.
+handle_paseo_bridge() {
+  local file="$LIVE_DIR/paseo-managed-bridge/server.js" st=0
+  if [ ! -f "$file" ]; then
+    log "  paseo-bridge: $file absent; nothing to patch"
+    return
+  fi
+  python3 - "$file" "$CHECK" <<'PYBRIDGE' || st=$?
+import os, sys
+path, check = sys.argv[1], sys.argv[2] == "1"
+OLD = 'error?.cause?.code !== "ECONNREFUSED" && error?.code !== "ConnectionRefused")'
+NEW = 'error?.cause?.code !== "ECONNREFUSED" && error?.code !== "ECONNREFUSED" && error?.code !== "ConnectionRefused")'
+real = os.path.realpath(path)
+with open(real, encoding="utf-8") as f:
+    text = f.read()
+if NEW in text:
+    sys.exit(0)
+if text.count(OLD) != 1:
+    sys.exit(11)
+if check:
+    sys.exit(10)
+tmp = real + ".new.%d" % os.getpid()
+with open(tmp, "w", encoding="utf-8") as f:
+    f.write(text.replace(OLD, NEW))
+os.chmod(tmp, os.stat(real).st_mode & 0o7777)
+os.replace(tmp, real)
+sys.exit(10)
+PYBRIDGE
+  case "$st" in
+    0) log "  paseo-bridge: ECONNREFUSED patch present" ;;
+    10)
+      if [ "$CHECK" = 1 ]; then
+        # Not an error: Paseo restores the original shortly after any patch.
+        log "  paseo-bridge: ECONNREFUSED patch not applied; run without --check only if the OpenCode model list is blank"
+      else
+        log "  paseo-bridge: patched $file; OpenCode reloads it. Paseo may restore the original within a minute, so check \`paseo provider models opencode\` now"
+        rc=1
+      fi
+      ;;
+    11) log "  paseo-bridge: vulnerable line not present exactly once in $file; Paseo may have fixed it (getpaseo/paseo#8780); not touching" ;;
+    *) log "  paseo-bridge: could not read or patch $file (python exit $st); no write"; rc=1 ;;
+  esac
+}
+
+log "opencode-plugin-guard $( [ "$CHECK" = 1 ] && echo '(check)' || echo '(enforce)') — $(gdate -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# An old obsolescence sentinel is not evidence of permission safety. Always
+# inspect the managed files; never execute `rtk hook opencode` as a probe.
+handle rtk "$LIVE_DIR/rtk.ts" "$CANONICAL_DIR/rtk.ts"
+handle_paseo_bridge
+
+# Retirement requires an explicit review of the upstream permission contract,
+# not a default export, a stale drift marker or a successful subcommand.
+exit "$rc"

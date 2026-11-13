@@ -1,0 +1,421 @@
+# Threat model: djbclark-ade (2026-10-20)
+
+Snapshot **2026-10-20**, written for reviewers (Codex's GitHub security review is set to read this file for
+every PR, operator; the `adversary` sub-agent and Cursor's review checks may too) and as the baseline the
+ADE-everywhere plan ([ade-everywhere-proposal.md](history/ade-everywhere-proposal.md) sections 1-4 and 11) assumes.
+Every claim names the file that shows it; a claim without a file is the operator's statement and is marked
+"operator". Re-read the code before relying on a line here: facts rot.
+
+**Re-based 2026-11-07 (slim-down E11; `slim/log.md` has every deletion); Wave 6 native-Paseo wording 2026-11-09.**
+Read this block first; the body below is the 2026-10-20 snapshot with dated notes, and a line that names a deleted
+tool describes the surface as it was.
+
+* **Deleted surfaces** (2026-11-06/07; R2-18 hooks 2026-11-10): `bin/zcode-key-auth`,
+  `bin/skillopt-night`, `bin/skillopt_sources.py`, `bin/failover.py`, `bin/skill-get`, `claude/hooks/prior_art_nudge.py`,
+  `claude/hooks/quota_nudge.py`, `claude/hooks/cswap_quota_context.sh`,
+  `bin/web-get`, `bin/ade-scan-state`, `bin/pr-wait`, `bin/local-review`, the quota guard and fleet governor, the
+  watch family, session-finder's launcher and fleet, the pi subagent extension, and every retired TUI's adapter.
+* **Entry points today**: (a) native `paseo run` (live ops; the launch line from `route_agent.py` `Choice.dispatch`,
+  which for Pi is `paseo run --provider pi/… --no-wait`) behind `load-watch admit` and the frontier allowance; (b)
+  native `paseo send --json` for agent-to-agent messages (standing order 10; ask for `ack <your id>`); (c)
+  `bin/review-launch` and `bin/review-pr`, the only way a review model is launched: read-only tools confined to a
+  clean worktree at the exact head, no MCP, no hooks, secret paths denied, a tripwire (exit 77) on the first step
+  outside (`review-boundary.md`); (d) the `adversary-marker` Action (`.github/workflows/adversary-marker.yml`), which
+  runs from master on `workflow_run` and `workflow_dispatch`, never checks out or runs PR code, and posts the required
+  status with the `ade-merge-gate` App's token (4.3); (e) `bin/load-watch`, `bin/deadline` and `bin/pr-policy`, the
+  remaining launchd jobs (`launchd/com.djbclark.load-watch.plist`, `config/launchd/com.djbclark.deadline-sweep.plist`,
+  `config/launchd/com.djbclark.pr-policy.plist`, plus the herdr server's plist for the installed bridges).
+* **Transitional shims (until ~2026-11-20 Wave 6 deletion)**: `bin/acp-dispatch` (over `paseo run`, or
+  `bin/review-launch` for a restricted Claude run), `skills/session-finder/relay.py` (over `paseo send --json`; Paseo
+  agents only, no anonymous send, fails closed on `paseo agent inspect`), and `tools/acp-run` beside the dispatch
+  shim. They keep one-cycle callers working; they are **not** the default launch or messaging path. Soft deadline
+  ~2026-11-20 (`tests/test_relay_shim.py::test_the_shim_is_removed_by_2026_11_20`; AGENTS.md "Two shims").
+* **TUI policy (2026-11-08)**: Pi is the sole general-purpose third-party TUI; required monthly-plan vendor clients
+  and Hermes remain. Archived omp/OpenCode clients are not live launch targets or fallbacks
+  (`docs/tui-security-and-pi-migration.md`).
+* **Trust (operator, 2026-11-07)**: our own agents on this machine trust each other (no sandbox between them is
+  demanded); **every GitHub artifact not authored by the owner is untrusted input** (diff, body, title, commits,
+  branch name, comments, bot and App comments, check output, CI logs); GitHub's own attribution is trusted
+  (AGENTS.md, Trust). The review boundary and the merge gate exist for that external case and stay strict.
+
+This repo is **personal tooling for one operator's machine, published as a public GitHub repo by choice**
+(`djbclark/djbclark-ade`). It runs no internet-facing service. `bin/firecrawl-router` is an HTTP listener (kept by the operator's ruling of 2026-11-07), on
+loopback by default (`--listen` defaults to `127.0.0.1:0`). With a child command it requires a random
+per-process bearer token. `--open` drops the token and refuses a non-loopback address, and since 2026-10-20 so
+does the serve-only form (no child, "for tests", no token): every tokenless run is loopback-only. While it runs, any process that
+can reach it can spend Firecrawl/LLM quota through it. The live router process holds whichever of
+`FIRECRAWL_SELFHOST_API_KEY`, `FIRECRAWL_API_KEY` (fallback) and the SIPB/LiteLLM keys (LLM extraction, on
+unless `FIRECRAWL_ROUTER_LLM=off`) are set, in memory (`build_router`, `build_extractor`); the child and the
+logs never receive them, but a compromise of the router process does. The repo itself holds no secret values.
+What makes the repo security-relevant is that it launches AI agents that run commands as the operator, unattended, and moves
+their output around.
+
+## 1. Scope and assets
+
+What an attacker would want, in order of damage:
+
+1. **Secrets in the `sudo-secretspec` vault** (API keys for model vendors, Cursor, Z.ai, Forgejo and
+   others). Not in this repo. The boundary authorizes the operator identity: any process running as the
+   operator that passes it can read every declared secret; client-family labels are correlation metadata,
+   not principals (proposal 4.5 item 1). `get` and `export` print values to stdout
+   (`~/src/sudo-secretspec/skills/sudo-secretspec/SKILL.md`, Pitfalls; the skill lives in the sudo-secretspec repo, unlinked from this one 2026-11-06); `run` injects them into a child.
+2. **Code execution as the operator.** (2026-10-20 snapshot; since 2026-11-06 agents run as Paseo agents in their
+   provider's mode, `--perm` best effort outside `bin/review-launch`.) Live launches are `paseo run` (or
+   `Choice.dispatch` → for Pi, native `paseo run --provider pi/…`). The transitional `tools/acp-run` path (until
+   ~2026-11-20) ran every agent yolo by default (all tool calls auto-approved, operator 2026-10-14); `--perm
+   read-only` restricts an agent to non-mutating tools, or refuses an agent without a verified equivalent, and
+   `--perm deny` gates every call except, for agy, the read-only `read` and `search` kinds that `bin/failover.py`
+   once passed as `--tripwire-exempt-kinds` (so an agy deny run can still read data; `tools/acp-run/README.md`
+   Permissions; `failover.py` itself was deleted 2026-11-06). Both perm modes are reserved for a
+   security-sensitive slice (4.1). The proposal says an unattended builder has the daemon user's credentials and
+   that scrubbed pastures and config stripping are reliability switches, not a boundary (proposal 10, risk 12).
+3. **GitHub write access** through the operator's `gh` login: push to this public repo, open and merge
+   PRs. Merged code is code the operator's machine then runs (4.6).
+4. **Cloud-agent credentials and spend**: `CURSOR_API_KEY` (`bin/cursor-cloud`) and the Codex/Cursor
+   GitHub apps' access to this repo (`docs/queue.md`, the carried "Cloud agents" line).
+5. **Agent state under `~/.local/state`**: dispatch records and reports (`~/.local/state/bigteam/<task>/`, still
+   written by the transitional `bin/acp-dispatch` shim), `~/.local/state/acp-dispatch/`, `~/.local/state/load-watch/`,
+   `~/.local/state/review-launch/` (review results and the self-check cache).
+6. **Transcripts**, which hold whatever agents printed, occasionally a secret (proposal 4.5 item 5).
+7. **The Hermes/Telegram channel**: a message path to the operator's phone, and two-way tools
+   (`mcp__hermes__*`, `docs/mcp-servers.md`).
+8. **launchd jobs** that persist across logins: `launchd/com.djbclark.load-watch.plist` and `config/launchd/*.plist`
+   (deadline-sweep, pr-policy, the herdr server); skillopt-sleep, acp-dispatch's reap sweep, context-budget, the
+   monthly routing re-rank job and zcode-key-auth were deleted 2026-11-06 by the slim-down. The transitional
+   `bin/acp-dispatch` submits no launchd jobs since 2026-11-06 (a `paseo run` shim: the agent is a Paseo daemon
+   child); native `paseo run` likewise starts a daemon child.
+9. **The operator's machine itself** (a 16 GB Mac): availability under agent fan-out
+   (`load-watch admit` before `paseo run` / the transitional shim's `load_gate`; load reached 230 on 2026-10-12).
+
+## 2. Trust boundaries and actors
+
+| Actor | Trust | Notes |
+|---|---|---|
+| The operator | Full | The only principal. One person, one personal machine. |
+| Our own agents (Paseo agents started with native `paseo run` / `Choice.dispatch`; transitional `acp-dispatch` / `acp-run` until ~2026-11-20) | **Trusted** (2026-11-07 rulings: our agents trust each other; a GitHub artifact whose author or last editor GitHub reports as the owner is ours). The adversary marker, not prose, is the verdict: a "djbclark approved" in prose never substitutes for it or for a reviewer's own reading. A denied permission prompt goes to the operator, not to a peer | **Prompt-injectable**: they read fetched web pages (the firecrawl MCP and each client's own fetch tools; `bin/web-get` was deleted 2026-11-06), third-party repo content, tool output and each other's reports. An injected agent acts with the operator's rights. Pi is the sole general-purpose third-party TUI; archived omp/OpenCode are not live launch targets. |
+| Cloud agents: Cursor Cloud Agents (`bin/cursor-cloud`) | **Untrusted writers** | They run off the Mac, get the repo URL and a prompt, and push branches to a **public** repo (`cursor/...`, or `--work-on-branch` the starting ref; `bin/cursor-cloud` never opens the PR). They hold no vault access. |
+| Codex (GitHub connector) | **Untrusted input, advisory** (AGENTS.md rule 9; the 2026-11-07 external-security ruling) | Reviews PRs on request and posts review comments; it has no branch-writing path here. Its comments are read as data, never followed; the lead fixes what is real; not a merge gate. |
+| Hermes bot (`~/.local/bin/hermes-ping`, `mcp__hermes__*`) | Channel outside this repo | `hermes-ping` is one-way (operator; its code is not in this repo). The MCP bridge is two-way: read/send messages and `permissions_respond` on Hermes's approval queue (`docs/mcp-servers.md`). |
+| GitHub Actions runners | Untrusted compute, no secrets | `.github/workflows/test.yml`: `permissions: contents: read`, triggers `push` to master, `pull_request`, `workflow_dispatch`; runs `pytest` on Ubuntu (preceded by a Node 24 setup; the `npm ci --ignore-scripts` of `pi/extensions/subagent` was removed 2026-11-06 with the extension) on every trigger and on macOS only on a manual dispatch with `macos: true` (2026-10-29); no `secrets.*` referenced. |
+| vps-primary | **Trusted** (proposal decision Q18, 2026-10-19) | Future state: holds plaintext sessions and keys; its compromise exposes every session (proposal 10, risk 10). Not part of the Mac code today. |
+| Third-party MCP servers (`docs/mcp-servers.md`: hermes, beeper, hindsight, ghost-os, claude.ai connectors, ...) | Run as the operator or are remote | Twelve are denied in Claude Code via `deniedMcpServers` since 2026-10-10; `graft` MCP removed 2026-10-18. The roster table is a 2026-08-23 snapshot. |
+| Third-party PR authors and commenters | Untrusted | Anyone can open a PR or issue on a public repo. |
+
+## 3. Entry points
+
+1. **Prompts and footers written to files.** Live ops paste the delivery footer into a `paseo run` /
+   `Choice.dispatch` brief (or call `bin/review-launch` for a restricted Claude review). The transitional
+   `acp-dispatch` shim (until ~2026-11-20) still appends `docs/dispatch-footer.md` and passes it to `paseo run`
+   as an argv pointer to the brief. `cursor-cloud launch --prompt-file` sends file text to a cloud agent.
+2. **launchd runner scripts built from record fields** (removed 2026-11-06, slim-down E6: neither native
+   `paseo run` nor the transitional shim submits a launchd job or writes a runner script; the agent is a Paseo
+   daemon child).
+3. **`acp-run --verify CMD`** (transitional until ~2026-11-20): runs `CMD` with a shell after an agent turn
+   (`tools/acp-run/README.md`, item 13). The one deliberate shell path on that shim; the string is whatever the
+   caller supplies. Native `paseo run` has no equivalent verify flag.
+4. **Load gate.** Live ops call `load-watch admit --wait N --json` before `paseo run` (since PR 7, 2026-10-20;
+   the transitional `acp-dispatch` shim's `load_gate` does the same; `machine_overloaded()` went with the E6
+   rewrite, 2026-11-06). Exit 75 refuses (admit's own exit 2 too). The gate fails open by design: a missing or
+   crashed load-watch, a timeout, any other exit, or exit 0 with output it cannot parse starts the slice anyway
+   with a stderr warning and `load_gate.error` in the shim's record (`bin/acp-dispatch` `load_gate`), and exit 0
+   is trusted over the JSON status.
+5. **PR bodies, review comments and issue text** written by agents or third parties, which other agents
+   and reviewers read as instructions.
+6. **Mentions**: `@codex review`, `@cursor` on a comment (`docs/queue.md`). Whether a third party's
+   mention triggers them is an app setting outside this repo and unverified: assume it can.
+7. **Environment variables** (trimmed 2026-11-07 to what exists). Tools read `ACP_DISPATCH_STATE` (the state root
+   for the transitional shim), `ACP_DISPATCH_LOCK_DIR`, `ACP_OPERATOR_APPROVED`, `CURSOR_CLOUD_API`, `LW_STATE_DIR`
+   and `LW_REGISTRY` (the runner exports, `ACP_DISPATCH_LAUNCHCTL`/`AIUSE`/`NO_GATE`, `ZCODE_CREDENTIAL_SECRET`,
+   and the three `*_LAUNCH_AGENTS` overrides went with their tools, 2026-11-06/07); `bin/firecrawl-router` reads
+   `FIRECRAWL_SELFHOST_URL`, `FIRECRAWL_FALLBACK_URL`, `FIRECRAWL_ROUTER_SIPB_BASE` and
+   `FIRECRAWL_ROUTER_LITELLM_BASE` (each held to https or loopback http, 2026-10-20), and the tools honour
+   `HTTPS_PROXY`/`http_proxy` and `SSL_CERT_FILE` (cursor-cloud drops them only when it re-execs for the key).
+   An agent that sets one for a child it
+   launches repoints a binary, an endpoint or an install directory.
+8. **Web content and repo files** fetched by an agent mid-session (prompt-injection carrier).
+9. **`load-watch` steer messages**: it writes a brief and sends one line to an agent with native
+   `paseo send --no-wait --json --behavior steer` (`bin/load-watch` header; no pane typing since 2026-11-06), so
+   text the tool composes becomes input to an agent. The transitional `relay.py` shim (until ~2026-11-20) reaches
+   Paseo agents only (`paseo send --behavior steer --no-wait --json --prompt-file`; herdr and Orca pane routes
+   retired). Paseo labels such a message `kind="agent-message"` with the sender's `PASEO_AGENT_ID` (a caller that
+   is not a Paseo agent prefixes `[relay from <name>] `), so a receiving agent sees a peer, not the operator
+   (advisory: Paseo does not verify the sender id, see 4.1); the shim refuses text starting with `/`, and sends
+   only when `paseo agent inspect` returns exactly the target's id, `Archived: false`, no pending permission or
+   question and status idle, running or closed (a stored agent the send resumes; a running agent only on a
+   provider that can steer); anything else is not sent. A sourceless send runs with `clearPendingPermissions`, so
+   a send into a card would answer it with the message text.
+10. **`bin/firecrawl-router`** (kept 2026-11-07, operator ruling): an HTTP listener, loopback by default (see the intro); any process that can
+    reach it can call it. From 2026-10-24 until the cutover (PRs 41, 43, 45) it also spent a GitHub token on
+    `/v2/search/developer`; that code and token are gone from the Mac: developer search is answered on Hyades
+    (firecrawl-hyades `docs/developer-search.md`). What it left behind there: the token (fine-grained,
+    public-repositories-read-only, probed 2026-10-24: a private repo answers 404) sits in the `djbclark-fc-searxng`
+    microVM's envs, readable by SIPB's Hyades admins and by anything that can run in that microVM or read
+    `hyades getconf`; being public-read-only, the worst it grants is search quota. The earlier classic-PAT residual
+    (private-code inference through page crowd-out and retry, adversary rounds 2 to 4) cannot arise with that token.
+    Anyone who can reach the Hyades gate with its bearer token can spend the shared GitHub quota; a per-caller budget is
+    not built and is required before the service is opened to the SIPB community.
+11. **Hermes to Claude delegation** (`delegate_task`, `claude-sub`; `docs/mcp-servers.md`): a message Hermes
+    acts on can become a headless agent run.
+12. **`bin/ade-update`** (2026-10-20): after its fast-forward pull it runs the `skill-everywhere` beside the running
+    `ade-update` (in the canonical checkout, the freshly pulled code), so upstream code executes without review; inherent to a self-updater, bounded by the
+    pull being fast-forward only from the configured remote, skill-directory names restricted to
+    `[A-Za-z0-9][A-Za-z0-9._-]*`, and links changed only in the canonical checkout. A non-canonical `--repo` (an
+    untrusted PR or cloud-agent branch inspected with `--check`) never has its own `bin/skill-everywhere`
+    executed: the helper is the sibling of the running `ade-update` (never chosen by `SKILL_EVERYWHERE_ADE`, which
+    only feeds the canonical-checkout test), and a sibling inside that checkout, like `PATH`, is not used, so the
+    skill step is skipped (Codex review and adversary round 4 of PR 20, 2026-10-20).
+13. **`bin/skillopt-night`**, the nightly launchd job: it feeds agent transcripts (which hold fetched web
+    text and third-party content) to a model and stages edits to SKILL.md / CLAUDE.md files "for review"
+    (file header). Injected text can become a staged instruction-file edit that every agent then follows.
+
+## 4. Threats, ranked
+
+Ranked by likelihood x impact for this repo today: prompt injection is the likeliest way into most of the
+others, and the merge path is unenforced. "Control" is what exists; "Gap" is what does not.
+
+### 4.1 Prompt injection of an agent (local or cloud)
+
+* **Control.** Briefs are scoped (`docs/orchestration-practices.md` section 2); the `adversary` is instructed
+  not to edit (its agent definition lives outside this repo and includes Bash, so that is an instruction, not a
+  sandbox); a read-only reviewer is built (2026-11-06): `bin/review-pr` over `bin/review-launch` (read-only tools confined to a clean worktree, no MCP, no hooks, a tripwire; `docs/review-boundary.md`); elsewhere `--perm read-only|deny` is best effort under the 2026-11-07 internal-trust ruling; the `adversary` reviews on request
+  before a PR is opened. Cloud agents run off the Mac with no vault. An agent messages a Paseo-hosted peer with
+  native `paseo send --json` (standing order 10). The transitional `session-finder/relay.py` shim (until ~2026-11-20)
+  still wraps that path: Paseo labels the message as an agent message from the sender, the shim passes the text in a
+  `--prompt-file` so it cannot become a `paseo send` option, and it refuses a leading `/` (after trimming the
+  whitespace and zero-width characters Paseo itself trims, and the full-width slash).
+* **Gap (2026-10-20).** Paseo does not authenticate the sender id: any same-user process can run `paseo send`
+  unlabelled or with any agent's id in `PASEO_AGENT_ID`, so the agent-message label and the transitional shim's
+  `[relay from <name>]` tag are advisory, and Paseo still records the message as a user turn in the receiver's
+  transcript. A permission card raised between the shim's `paseo agent inspect` and its send is still answered by the
+  send (Paseo has no conditional send). Candidate upstream issue.
+* **Gap.** A local agent reading a hostile page or third-party file runs yolo with the operator's rights;
+  nothing screens tool output for instructions. A cloud agent reading this public repo's issue or PR text
+  can be steered by a third-party commenter if a mention triggers it. Staged skill edits from
+  `bin/skillopt-night` are instruction changes: review them as such.
+
+### 4.2 Secret exfiltration
+
+* **Control.** Keys are read through `sudo-secretspec`: `run` (`bin/cursor-cloud` re-executes itself under
+  it when `CURSOR_API_KEY` is absent; `bin/zcode-key-auth` does the same for `ZAI_CODING_PLAN_API_KEY` and
+  prints only hashes via `fp()`) or `get` captured into memory, cached per process and never printed
+  (`bin/failover.py` `secret_value`). The vault ledger is audited (`audit-verify`, skill file).
+  [docs/code-review.md](code-review.md) (PR 9, 2026-10-20), rule 3 forbids a key in argv, a log, a tracked file
+  or a fixture.
+* **Gap 1.** `get` and `export` print values to the caller's stdout; the client does not redact. An
+  injected agent that runs them puts values in its transcript. The boundary cannot tell an honest agent
+  from an injected one.
+* **Gap 2.** `bin/zcode-key-auth` writes the key into zcode's own store (`~/.zcode/v2/credentials.json`),
+  AES-256-GCM with a key derived from `ZCODE_CREDENTIAL_SECRET` or a fallback built from platform, home and
+  user name (file header). Anyone running as the operator can derive it. It is the one sanctioned place a
+  key is written.
+* **Gap 3.** Cloud agents get the repo and prompt, not secrets, but a secret in a prompt file or repo file
+  leaves the Mac; no scanner runs on prompts.
+* **Gap 4 (narrowed 2026-10-20).** `CURSOR_CLOUD_API` (`bin/cursor-cloud`) repoints the endpoint that receives
+  `CURSOR_API_KEY` in a Basic auth header. The same shape in `bin/firecrawl-router`: `FIRECRAWL_SELFHOST_URL`,
+  `FIRECRAWL_FALLBACK_URL`, `FIRECRAWL_ROUTER_SIPB_BASE` and `FIRECRAWL_ROUTER_LITELLM_BASE` choose where
+  `call()` and `Extractor._post()` send the matching bearer keys. An agent that sets one for a child, or starts
+  a router with them repointed, sends the key to that host. *Closed (2026-10-20):* cleartext to a non-loopback
+  host (cursor-cloud takes exactly `https://api.cursor.com`; the router's four bases must be https or loopback
+  http with a plain `host[:port]`: no userinfo, backslash or whitespace); replay on a redirect (keys are
+  unredirected headers behind a `_NoRedirect` opener, and a 3xx from a backend is a refused request, for 301,
+  302, 303, 307 and 308); a client-chosen request target (the router answers HTTP 400 to a target that does not
+  start with `/`, and `call()` refuses any target that changes the base URL's netloc, so `.evil.example/x`,
+  `:1/x` and `@evil.example/x` no longer move the key); the two test flags `CURSOR_CLOUD_ALLOW_HTTP` and
+  `FIRECRAWL_ROUTER_ALLOW_HTTP` (removed: an actor who can set the endpoint variable could set the flag);
+  `PYTHONPATH` and a planted `sitecustomize.py` for cursor-cloud (shebang and re-exec use `python3 -I`); proxy,
+  `SSL_CERT_*` and `PYTHON*` variables on the re-exec that fetches the key (dropped). *Remains:* the router
+  accepts https to any host, so an actor who starts a router with a base repointed to `https://evil.example`
+  still receives that backend's key; `bin/cursor-cloud` run with `CURSOR_API_KEY` already in the environment
+  (no re-exec) still honours `HTTPS_PROXY` and `SSL_CERT_FILE` from the caller's environment, as does the
+  router for its own process (an environment-controlling actor can read the keys off the wire); and any actor
+  that can edit the launch environment of the LaunchAgent (Ansible `shared_mcp` role) or the scripts
+  themselves. Reviews: adversary BLOCK on c63694e (the request-target flaw above, which predated the diff),
+  fixed on this branch.
+
+### 4.3 Unenforced review and merge
+
+* **Control (procedure only).** [docs/code-review.md](code-review.md) (PR 9, merged 2026-10-20), rule
+  1 requires the PR body to carry the adversary verdict as a machine-readable marker naming the head
+  reviewed (`<!-- adversary-verdict:v1 {...} -->`, since 2026-10-25), and whoever merges to use
+  `gh pr merge --squash --match-head-commit <reviewed sha>`. The marker parser (in the PR waiter from
+  2026-10-27, PR 66; moved unchanged to `bin/adversary_marker.py` on 2026-11-06, slim-down E8) reads that
+  marker; it does not read prose. Since 2026-11-06 the `adversary-marker` Action posts it as a commit status
+  from the `ade-merge-gate` App; it becomes an enforced control only once the operator's ruleset requires
+  that status pinned to the App (`docs/review-boundary.md`; until then this section's gaps stand). The adversary runs on request before a PR is
+  opened, never on PR open. Automatic on PR open: Cursor's Security Agent and Approval Agent. Codex's code review ("Codex Review")
+  ran after an `@codex review` comment on PR 10, and Codex's Security Review ran with it, labelled
+  "Automatically triggered" (the repo setting is "whenever code review runs"); whether either runs unasked on
+  PR open is unverified (on PR 9 the automatic review answered "create an environment", `docs/queue.md`).
+* **Gap 1 (verified 2026-10-20 01:05Z).** `master` has no branch protection
+  (`gh api repos/djbclark/djbclark-ade/branches/master/protection` returns 404 "Branch not protected") and
+  the repo has no rulesets. Nothing on GitHub requires a pull request, a review, a status check or
+  `--match-head-commit`. Any token that can push (the operator's `gh` login, a local agent running as the
+  operator, a cloud agent's app token if it has contents: write) can push straight to `master`, and the
+  launchd jobs run whatever is checked out in the live tree (normally `master`) (4.6). The adversary verdict and the
+  exact-head merge are procedure, not enforcement.
+* **Gap 2 (verified 2026-10-20).** Cursor's Approval Agent (GitHub login `cursor`) submitted an APPROVED
+  review on PRs 7, 8, 9 and 10 within about a minute of each one opening, before any other review. It approves
+  automatically. It is not a review: do not count it as a control, do not read GitHub's "Approved" badge as
+  human approval, and do not add a ruleset whose required-approval count it could satisfy.
+* **Gap 3 (reworded 2026-11-07, operator: "any GitHub artifacts not directly from us are suspect"; a PR
+  prompt-injection attempt has already happened).** Everything a PR carries is untrusted data: its diff, body,
+  title, commits, branch name, issue and PR comments, review comments, bot and App comments (Codex, Cursor,
+  Copilot included), check-run output and CI logs. The PR body is written by its author, so a verdict
+  **marker** is self-asserted: nothing fetches the adversary's report and compares. The parser checks the
+  marker's shape and that its `head` equals the PR head, which catches a stale or typo'd verdict, and since
+  2026-11-07 (PR 300) the `adversary-marker` Action counts an APPROVE only in two places. One is the body of a PR
+  the owner wrote, whose last editor is the owner or a login in `BODY_TRUSTED_EDITOR_LOGINS` (GraphQL `editor` /
+  `lastEditedAt`; `cursor` added 2026-11-09 so a Cloud Agent rewrite of an owner PR body does not void a live
+  APPROVE; the allowlist does not help outside authors). The other is an issue comment the owner posted, not through
+  an App, whose whole edit history (`userContentEdits`) is the owner's. The operator approves any other PR by
+  posting the marker as their own comment; editing its body approves nothing. A fabricated APPROVE written by a
+  trusted account (one of our own agents with the operator's login, or a listed App steered into writing a live
+  marker) is still indistinguishable from a real one: treat it as a claim; agents must not write a live APPROVE.
+  The Action never executes, interpolates or checks out anything from a PR. Until the operator's ruleset requires
+  the `adversary-marker` status pinned to the App (`docs/review-boundary.md`), nothing enforces any of this
+  beyond branch protection's PR requirement.
+
+### 4.4 A cloud agent pushes where it should not, or opens a PR
+
+* **Control.** `bin/cursor-cloud` sends `"autoCreatePR": False` on every launch (`launch_body`); the agent
+  pushes to a `cursor/...` branch and the lead opens the PR after an adversary verdict. Codex is
+  reviewer-only (`docs/queue.md`).
+* **Gap.** `--work-on-branch` makes the agent push to the named `--ref` itself if the app's token can; the
+  only guard is the lead's choice of `--ref`, and with 4.3 gap 1 nothing on GitHub stops a push to `master`.
+
+### 4.5 Hermes/Telegram as a command channel
+
+* **Control.** `hermes-ping` (operator) is one-way and used for notices (`bin/load-watch`, `bin/zcode-key-auth`).
+* **Gap.** `mcp__hermes__messages_send`, `events_wait` and `permissions_respond` (`docs/mcp-servers.md`)
+  are two-way: an injected agent can message the operator and can answer Hermes's pending exec or plugin
+  approval prompts. Text read through Hermes comes from whoever can message the operator on a connected
+  platform: treat it as untrusted input. Hermes can also start Claude headless (`delegate_task`,
+  `claude-sub`; `docs/mcp-servers.md`), so a message Hermes acts on can become an agent run. The proposal
+  plans a Paseo Telegram plugin to replace the relay (proposal 10, risk 13); it is not built.
+
+### 4.6 launchd persistence
+
+* **Control.** Plists are installed by tools' own subcommands (`load-watch install`, `deadline install`,
+  `pr-policy install`, or `bin/ade-sched`; `skillopt-night install`, acp-dispatch's reap sweep installer,
+  `zcode-key-auth install` and `context-budget-check install` were removed 2026-11-06),
+  copied from `launchd/` to `~/Library/LaunchAgents`. No installer was found (2026-10-20) for
+  the monthly routing re-rank plist (deleted 2026-11-06; optional Paseo schedule `routing-recalibrate` in
+  `config/install.toml` / `docs/scheduling.md`, 2026-11-10). No per-slice jobs remain.
+* **Gap.** A plist in a PR is code that runs as the operator at every login: review label,
+  `ProgramArguments`, `WorkingDirectory`, `PATH` (fixed paths under `/Users/djbclark/...`). Every shipped
+  plist runs its script from the live checkout, so a change to `bin/load-watch` (every 20 s),
+  `bin/deadline` or `bin/pr-policy` runs within one schedule tick of being pulled or checked out there, without
+  reinstalling anything. Review those scripts as you would a plist. Merging is deployment.
+
+### 4.7 Supply chain
+
+* **Control.** CI installs with `uv run --with pytest --with 'agent-client-protocol>=0.9,<1.0'`
+  (`.github/workflows/test.yml`). Actions are referenced by major tag. (`bin/web-get`'s `pypdf` pin and the skillopt
+  receipt check went with those tools, 2026-11-06.)
+  (Until 2026-11-06 the Linux job also ran `npm ci --ignore-scripts` in `pi/extensions/subagent` (devDependencies for the
+  extension's offline tests): the committed `package-lock.json` pins every package to a registry.npmjs.org
+  URL with an integrity hash (checked 2026-11-03: all 123 entries), and lifecycle scripts never ran; the step and the extension are deleted.)
+* **Gap.** The ACP client dependency is a range, not a pin; actions are tags, not SHAs; CI runs
+  `brew install` from default taps and the Linux job runs an unpinned `apt-get install -y -qq gawk`. The
+  proposal (Q22) accepts Homebrew's curl-pipe installer and relies on `tools.toml` checksum pins that do
+  not exist yet (proposal 4.4 is a design). Plugins are ordinary dependencies that run as the daemon user
+  (proposal 10, risk 14).
+
+### 4.8 Command injection into runner scripts
+
+* **Control.** Per-slice launchd runner scripts are gone (entry 2, 2026-11-06). What remains of that surface
+  on the transitional `acp-dispatch` shim (until ~2026-11-20): every interpolated value in printed resume and
+  rearm hints and the wait helper goes through `shlex.quote` (`rearm_cmd` and related helpers in
+  `bin/acp-dispatch`). Subprocesses use argv lists; a stored command is `shlex.split` back, not run through a
+  shell. Native `paseo run` starts a daemon child with argv, not a shell string.
+* **Gap.** Quoting protects against bad values, not a tampered record (4.9). Transitional `acp-run --verify`
+  is a shell by design (entry 3).
+
+### 4.9 State tampering under `~/.local/state`
+
+* **Control.** Atomic writes (`write_atomic`, `os.replace`), a record lock (`update_record`), new fields
+  read with `.get` (still used by the transitional shim's records and by `load-watch` / `review-launch` state).
+* **Gap.** While the transitional `acp-dispatch` shim remains, its unsigned record under
+  `~/.local/state/acp-dispatch/` / `bigteam/` is that shim's source of truth for outcomes and resumes. Any
+  process running as the operator can edit a record; per-slice launchd runners are gone (entry 2), so the
+  persistence path is no longer "edit a runner and wait for launchd", but a local foothold can still rewrite
+  shim state the lead or waiters trust. The same process can edit `~/.config/load-watch/ci-only.tsv`, which
+  `bin/load-watch` only parses as a repo policy (which repos must build in CI, and how): that is an
+  availability or policy change (`bg` refuses or allows local builds), not executed content. Accepted
+  (section 5), but a PR that widens either is still a finding.
+
+### 4.10 Denial of the operator's machine
+
+* **Control.** Live ops (and the transitional shim) call `load-watch admit` before starting a slice; `load-watch`
+  finds the session behind sustained load and steers it with `paseo send` to move heavy work to CI; `ci-only`
+  makes `bg` refuse local builds (`bin/load-watch` header). The pre-shim overload hold
+  (`machine_overloaded()` / `wait_for_capacity`, up to 900 s) and the dispatcher's own auto-resume (capped at
+  3 attempts, gated on live pool headroom) went with the E6 rewrite (2026-11-06); Paseo's session-guard /
+  usage-auto-resume cover quota pauses instead.
+* **Gap.** The `admit` gate fails open (entry point 4). PR 7's `admit` (merged 2026-10-20) adds admission with
+  stagger and pending-runner accounting; a wave of dispatches overloaded the Mac on 2026-10-12, before `admit`
+  existed.
+
+## 5. Out of scope and accepted risks
+
+Accepted means a PR is not asked to defend against it; a PR that widens what an injected agent or a
+tampered state file can do is still a finding (section 6 item 6).
+
+1. **One operator, one personal machine.** No defence against another process running as the operator
+   (4.2 gap 1, 4.9). Operator-accepted (proposal 4.5 item 1).
+2. **Yolo agents** (operator 2026-10-14): the mitigation is reviewing outputs, not restricting tools.
+3. **The repo is public by choice** (since 2026-10-08). Anything committed is world-readable; secrets
+   policy depends on rule 3 (PR 9), not on privacy.
+4. **vps-primary is trusted**; a compromise there is accepted as total (proposal Q18, risk 10).
+5. **Vendor and platform risk**: GitHub, Forgejo, Hyades, model vendors, Cursor and Codex services
+   (proposal T4 lists these as accepted outside dependencies).
+6. **`fleet-watch`** lives at `~/ops/site-private/bin/fleet-watch`, not in this repo's `bin/` (the
+   `bin/fleet-watch` link in AGENTS.md is dead on 2026-10-20), so its code is outside this review's reach.
+7. **Docs carry dated snapshots**; a mismatch between a doc and the code is a doc bug to fix in the same
+   PR. But when a PR removes or weakens a control this doc names (for example `autoCreatePR: False`,
+   `shlex.quote` in a runner script, the `sudo-secretspec run` re-exec), treat it as a security finding first.
+8. **(Removed 2026-11-06 with the tool.) `ade-scan-state --remote` trusted the origin's advertised refs** (2026-10-23, Codex pass 56 on PR 27): a hostile
+   origin that names a local-only commit makes it count as pushed. Origins are the operator's own; the scan deletes
+   nothing, and the generated report says (limit 10) that `clean and pushed` is not proof of possession. The size
+   of the advertisement is bounded too (2026-10-23): `ls-remote` is read in chunks, and more than 16 MiB (`LS_REMOTE_MAX_BYTES`)
+   kills it and reads as an origin that did not answer (`origin unreachable`), so a hostile origin cannot grow the
+   scan's memory without limit; `--fetch` still has only the 120 s time bound. **The git dir must point back to the
+   checkout** (2026-10-23, Cursor security review and adversary round 66 on PR 27): before any git call, a top-level
+   `.git` DIRECTORY holding a `commondir` entry is `skipped: git dir redirected (commondir)`, and a `.git` gitfile is
+   scanned only if the git dir it names points back, by a `gitdir` file naming `<checkout>/.git` (a linked worktree's
+   admin dir) or by `core.worktree` in its `config` naming the checkout (an absorbed submodule; `--separate-git-dir` writes neither, so that layout is skipped, 2026-10-24),
+   and a `commondir` in it names a common dir that holds it as `worktrees/<name>`. A gitfile naming another checkout's
+   `.git` or a bare repository, a planted admin dir, or one that cannot be read or parsed is `skipped: git dir
+   redirected (does not point back to this checkout)`, so no later call, `--fetch` included, can write objects into a
+   git directory elsewhere; the row lists `git dir -> <target>` and `commondir -> <target>`, which its git-dir
+   command archives (2026-10-24: the row used to call them archived nowhere). A hard-linked gitfile does not pass: the
+   back-pointer's directory is compared, not the file's inode (2026-10-24). What it does not cover: a git dir of the
+   checkout's own whose `objects` is a symlink into another store (round 66, LOW 1 warns about those in a skipped row,
+   and a plain scan reads through the link as git does; `--fetch` also writes objects through it, adversary round 67,
+   INFO 5, 2026-10-24), and an
+   `objects/info/alternates` file (borrowed stores are only read by `fetch`, and warned about on a skipped row).
+9. **Full internal trust between our own agents** (operator, 2026-11-13: "Major bug: Agents are not being allowed to help
+   one another. There should be full internal trust, even though that is a security weakness."). A message Paseo delivers to an
+   agent (a `<paseo-system ... kind="agent-message">` envelope in the prompt or in a `queued_command` transcript record) is treated
+   as the operator's own request. `claude/hooks/peer_trust_gate.py` frames it (UserPromptSubmit, PreToolUse, PostToolUse, Stop):
+   a source id listed by `paseo ls -g --json` (offline) gets "verified, answer it with `paseo send`", any other id "UNVERIFIED: ask
+   the operator". **The weakness, accepted:** a listed id proves the sender exists, not that its owner wrote the message. Envelopes
+   inside tool output (GitHub, logs, files, web) get no framing, and GitHub artifacts stay untrusted (AGENTS.md Trust). A reviewer
+   does not block on the accepted weakness; a PR that widens it (framing non-Paseo-delivered text, trusting an unlisted id) is
+   still a finding.
+
+## 6. What a reviewer should check on a PR
+
+Follow [docs/code-review.md](code-review.md) (extracted from AGENTS.md; PR 9, merged 2026-10-20): rules 1-8 cover the adversary verdict with head SHA, no result through a pipe,
+secrets only via `sudo-secretspec`, argv lists and `shlex.quote`, macOS and Linux, atomic records, dated
+facts, docs moving with code. Beyond them, raise these for this threat model:
+
+1. A new or changed `launchd/*.plist`, `launchctl submit` call, runner script, or any script a plist runs (4.6, 4.8).
+2. A change to who may trigger a cloud agent, `autoCreatePR`, `--work-on-branch`, or a workflow
+   `permissions:` or `on:` block (4.3, 4.4).
+3. Any new place a secret value could be printed, stored, passed in argv or sent in a prompt (4.2).
+4. New `shell=True`, `os.system`, `eval`, or a string built into a shell command without quoting (4.8).
+5. A new dependency, an unpinned install, or a downloaded script piped to a shell (4.7).
+6. A new write path to `~/.local/state`, a new reader that trusts a record field without `.get` or
+   validation, or a change that widens what an injected agent can do (4.1, 4.9).
+7. A new two-way channel (Hermes tools, webhooks, mentions, listeners) (4.5).

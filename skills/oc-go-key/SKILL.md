@@ -1,0 +1,155 @@
+---
+name: oc-go-key
+description: >-
+  Archive only (Pi sole-TUI 2026-11-08/09): historically recovered an OpenCode Go session that
+  stopped with "Go usage limit exceeded" or "Insufficient account funds" via `oc-go-key use
+  <label>` and a resume. OpenCode is not a live TUI; do not choose it for new work. Prefer Pi /
+  native `paseo run` pools once separately accepted (`docs/pi-defaults.md`, queue item 36).
+version: 0.1.0
+author: Dan Clark (djbclark), Dann 7
+license: Apache-2.0
+platforms: macos
+tags: opencode, opencode-go, quota, credentials, continuity, macos, archive
+---
+
+# oc-go-key — archived OpenCode Go quota wall
+
+**Archive (Pi sole-TUI policy, 2026-11-08/09).** OpenCode is not a current chooser, default, or
+supported live TUI. This skill records the retired OpenCode Go credential-rotation path only; it
+is not a live Pi or Paseo recovery path. Keep for history; do not start OpenCode for new work.
+
+A Go quota wall (on the retired OpenCode transport) did not look like a crash. It looked like the
+tab quietly stopped:
+
+| Text in the tab | Bill it refused | Helps to rotate the credential? |
+| --- | --- | --- |
+| `Go usage limit exceeded` | the Go subscription behind the active credential | yes, to an account with Go left |
+| `Insufficient account funds` | the Console **credit balance** (`opencode/<model>` prefix) | only onto a credential whose balance is not empty |
+| `requires Global regions` | not quota at all: the account's workspace region setting | no — fix Settings › Privacy › Regions |
+
+Rotating is a **spend-policy decision** (which account's quota to burn), so this skill reports the
+state and performs the rotation when asked; it does not decide on its own which account to spend.
+
+## Read the state first
+
+```sh
+~/src/djbclark-ade/skills/oc-go-key/scripts/go-status        # rc 2 = a wall in the last 30 min
+~/src/djbclark-ade/skills/oc-go-key/scripts/go-status --hours 24
+```
+
+It prints every server, every credential label with the active one starred, the failures in the
+log window, and the account table. Read-only; it prints labels and emails, never key material.
+As of 2026-10-30, failure explanations are fixed text; failed credential listings withhold raw
+diagnostics. Exit 2 and the recovery advice come from OpenCode Go/Console failures: the Go wall,
+no-funds and region errors attribute themselves by their own text (OpenCode's log records carry no
+provider field), and an auth failure counts only when its record names an `opencode`/`opencode-go`
+provider. A recent auth failure with no provider recorded exits 3 with no rotation advice (it may be
+another provider's key); a foreign one is listed and advises nothing. Timezone-free timestamps are skipped.
+
+## Which credential actually serves Go — the trap
+
+OpenCode v2 keeps credentials in `~/.local/share/opencode/opencode.db`, shared by the background
+service and every `opencode serve` a Paseo tab owns. **`opencode-go/*` models are authenticated by
+the active credential of the Console integration `opencode`**, *not* by the `opencode-go` key
+credential. On 2026-10-29 a day went into activating `opencode-go` keys that were never consulted,
+while the real source was an exhausted Console login, with no error saying which credential a
+request used ([anomalyco/opencode#52374](https://github.com/anomalyco/opencode/issues/52374)).
+
+Consequence: `oc-go-key list`'s `*` on the `opencode` row is the one that matters. The
+`opencode-go` row can be starred and irrelevant.
+
+## Rotate
+
+```sh
+oc-go-key list                       # labels, active, which server pids
+oc-go-key use dclark                 # label, or a vault name (OPENCODE_GO_API_KEY_<X>)
+oc-go-key use djbclark
+oc-go-key use t-e
+```
+
+`use` activates the credential, then `POST /api/location/reload` on every running server **that has
+no active session** (checked with `GET /api/session/active` just before each reload), so idle
+sessions pick the new key up at their next step — no new tab. Two consequences, both real:
+
+- a reload **cancels pending permission prompts and forms**; do not rotate while the session is
+  waiting on an answer you care about;
+- a reload changes the key, **not the prompt**. See below.
+
+**Between turns only.** A reload during a turn can end the execution as `shutdown`, which Paseo's
+OpenCode adapter treats as resumable and then waits on forever (the phantom "running" agent, RCA
+2026-11-02). So a busy server is **not** reloaded: the credential is still activated at once, the
+server is recorded in `~/.local/state/oc-go-key/pending.json` (urls and pids, no secrets),
+`swap deferred: N active sessions` is printed and the exit code is **3**. Finish it later with
+`oc-go-key reload` (it reloads whatever is idle by then and clears the record) or give
+`--wait-idle S` to `use`/`reload` to poll every 5 s for up to S seconds and reload as soon as the
+server is idle. `oc-go-key pending` shows what is waiting. An unreadable `/api/session/active`
+counts as not provably idle and defers too. Exit codes: 0 done, 1 error, 2 usage, 3 deferred. A
+session that stopped on a quota error is already idle, so the usual rotate-then-resume is not
+delayed by this.
+
+`use <vault name>` reads the key with `sudo-secretspec get` (never argv, env or disk) and recreates
+the credential if the vault value changed. If a Console **login** of the same label exists, that
+login wins and the key is not substituted.
+
+## Resume — the step that is usually skipped
+
+The turn that hit the wall **already failed**. A new key alone leaves the tab idle and silent: the
+entity is dark, now with a working credential. Re-prompt it with native `paseo send` (Wave 6:
+do **not** call the retired Wave 6 shims):
+
+```sh
+YOUR_ID=$(paseo ls -a -g --json | …)   # this agent's id; never invent one
+paseo send --json --no-wait <session-id> --prompt \
+  "Quota wall: the Go account was exhausted and the credential is now '<label>'. Your last turn was
+   cut off mid-work. Check your own last state and continue it; do not restart from the beginning.
+   Please reply: ack ${YOUR_ID}"
+```
+
+Find `<session-id>` from `paseo ls -a -g --json` (session-finder's `fleet.py` was removed
+2026-11-06), the registry row, or the tab — give `paseo send` an **id**, never a name. After
+rotating for yourself, continue in place rather than opening a new tab.
+
+**Read the exit, do not assume the send.** Standing order 10: `paseo send`'s `$?` is never
+delivery; an agent-to-agent send is accepted (exit 5: queued) and proven only by the peer's
+`ack <your id>`. Exit 2 is not delivered. Check your own inbox for the ack; re-send when none
+arrives; report a peer you cannot reach rather than assuming it read. Say so through
+`hermes-ping` rather than moving on, and tell djbclark which account was exhausted and which
+credential now serves it.
+
+First contact with a stopped session always asks for the named ack (put
+`Please reply: ack <your id>` in the text and pass `--no-wait`, since a send to a busy peer can
+block for minutes).
+
+## When no account has headroom
+
+Stop, and say so:
+
+1. `scripts/go-status` to confirm the wall is quota and not `region`/`auth`.
+2. Tell djbclark via `hermes-ping "…: all OpenCode Go accounts exhausted (reset <window>)"`, once.
+3. Do not spin: no retries, no re-dispatches. A wall that reset-time fixes is not a bug to work
+   around, and burning another pool's quota to hide it is not a continuity fix.
+4. If the work matters more than the wait, route it elsewhere for real (`skills/model-routing`), and
+   say which pool you moved to.
+
+## Gotchas
+
+- **Prefix chooses the bill.** `opencode-go/<model>` draws the Go subscription; `opencode/<model>`
+  draws Console credits. A Go wall on a session that is actually on `opencode/` is a funds wall —
+  rotating credentials is right, but check the model prefix before blaming Go. A Paseo agent's model
+  is `settings.model`; `paseo agent update` changes it.
+- **`dclark` needs Regions = Global** for DeepSeek models (`requires Global regions`);
+  its workspace was switched on 2026-10-29.
+- **Never print a credential.** Not the key, not an OAuth `access` token, not a log line holding one.
+  The 2026-10-29 session leaked a Jina bearer token into a transcript through name-based redaction;
+  cite the field name, never the value.
+- **`oc-go-key` lives in `~/src/one-offs/stow/bin/oc-go-key`** (stowed as `~/.local/bin/oc-go-key`),
+  and needs `sudo-secretspec` for vault names. It cannot run where those are absent.
+- **Restarting a tab is not a fix** and not the same thing: it loses the turn, the pending prompt
+  and the context. Rotate + resume, in that order.
+
+## Related
+
+- `~/ops/site-private/memory/reference_hermes_opencode_go_key.md` — the Hermes side of the same
+  provider (untouched by `oc-go-key`).
+- `~/src/one-offs/stow/README.md` § oc-go-key — the upstream tool and how it works.
+- `skills/model-routing` — where to send work when Go is not an option.

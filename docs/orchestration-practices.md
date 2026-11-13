@@ -1,0 +1,318 @@
+# Orchestration practices: decide cheaply, reason expensively, verify centrally
+
+Snapshot **2026-10-11**, re-based on native Paseo **2026-11-09** (Wave 6 caller rewrite; slim-down E11). The rules every
+orchestration skill here follows (`fan-out`, `research`, `dialogue`, `model-routing`). Each skill carries the short form
+of the rules it needs and links here for the reasons and sources.
+
+**Standing operator requirement:** every orchestration skill can dispatch to several providers. Since 2026-10-31 (Paseo is
+the only harness) every agent is a Paseo agent. Live ops launch with native `paseo run` (in process through the Agent tool
+or a Workflow; out of process with `paseo run --no-wait` in a claimed worktree), collect with `paseo wait`, and message
+with `paseo send --json`. Query `paseo provider ls --json` for the live registry. Since 2026-11-08 Pi is the sole
+general-purpose third-party TUI; required monthly-plan vendor clients and the Hermes exception remain. Archived
+omp/OpenCode clients are not dispatch targets or fallbacks. `skills/fan-out` is the how-to.
+
+`bin/acp-dispatch`, `skills/session-finder/relay.py` and `tools/acp-run` are transitional Wave 6 shims over those native
+commands (soft deletion deadline 2026-11-20; [docs/slim/wave6-follow-up.md](slim/wave6-follow-up.md)). Do not start new
+call sites on them; do not invent shim flags.
+
+**Permission mode (2026-11-12):** every ordinary launch, child and trusted internal
+review uses catalog-backed unattended permissions. Explicit operator restrictions
+and external-security-critical work preserve the restricted boundary. Provider
+`defaultMode` is not proof. The create hook selects verified IDs/controls; resume
+preflights refuse saved mode drift. See [agent modes](agent-modes.md) for provider
+coverage, `ade-agent-mode check` / dry-run-default repair planning, runtime readback and
+unsupported native API limits. No plugin was installed by this cloud change.
+
+## 1. Two kinds of work in an agent loop
+
+1. **Reasoning** has an open-ended answer: plan, write code, debug, adjudicate.
+   It goes to the judgment tier (Claude, codex, antigravity's Claude/GPT pool).
+2. **Deciding** picks from a short list the harness already holds: which pool,
+   which kind, retry or reassign or stop, which notes go in a brief, which
+   tests run first. These are multiple-choice questions.
+   They should not get a frontier model writing a paragraph before it
+   commits.¹
+
+**Ladder for a decision, cheapest first:**
+
+1. **Code.** A rule or a table: `route_agent.py plan`, the report / wait
+   classification codes (section 5), `aiuse --available`'s exit 3, `git diff --name-only` to pick tests.
+   Deterministic, free, and auditable. The reaction to a quota stop is the
+   provider's: Paseo's session-guard pauses at exhaustion and usage-auto-resume
+   continues after the reset (the dispatcher's own auto-resume was retired 2026-11-06).
+2. **A typed decision model**, a call that returns a probability per option
+   and no text (TypeSafe's Jev was one; it ran in shadow mode only and was
+   removed 2026-11-06). Code reads the probability and applies a threshold.
+   Never ask a model how confident it is; read the distribution.¹ ⁴
+3. **A cheap text model** at low effort (haiku, a free pool), with a closed
+   option list and a parser that rejects anything off the list.
+4. **The judgment tier**, when the question is not really multiple choice,
+   or the cheaper rung was unsure.
+
+**Rules for every rung:**
+
+1. **The harness writes the options.** Each option is something code knows
+   how to act on. A model that writes its own option list puts you back to
+   parsing free text.¹
+2. **Thresholds by risk.**¹
+   a. Cheap to undo (note selection, test order): act at about 0.55-0.65.
+   b. A wrong answer costs a failed step the harness catches (routing,
+      recovery): about 0.8.
+   c. Hard to undo (delete, force-push, production config, migrations,
+      removing a feature the operator built): no model decides alone; the
+      operator, or the judgment tier plus a confirmation step.
+3. **Below the threshold, route up**, never guess. Routing errors are
+   asymmetric: a hard slice sent to a cheap worker costs a failed step and a
+   retry; an easy slice sent up costs a little extra.¹
+4. **Caps live in code, not in prompts.** "Retry at most 3 times" in a prompt
+   is sometimes 30; a counter is not.¹ ³
+5. **Shadow before switching.** Before a new decider acts, log its answer
+   beside the current one, read only the disagreements, and set the
+   threshold from them. Put every decider behind a flag that turns it off.¹
+6. **Known weak spots of typed deciders:** arithmetic and counting, date
+   comparison, literal reading of negations; do those in code.⁴
+
+## 2. Context: give each worker only what it needs
+
+1. **Always-load set:** the concurrency contract, security rules, the
+   repo's non-negotiables. Never scored out.
+2. **Select the rest per slice.** A brief carries the notes, files and
+   findings that slice needs, not the whole `AGENTS.md` tree. Keep a floor
+   (if nothing scores, include the top two) and **log what was left out**:
+   when a slice goes wrong, first check whether the note that would have
+   prevented it was dropped.¹
+3. Context selection is the riskiest decision to automate, because a wrong
+   drop fails silently.¹ (A reader's reply to the source thread.) Until a
+   shadow log shows otherwise, the orchestrator picks a brief's notes itself.
+
+## 3. Briefs: the spec is the multiplier
+
+A vague brief makes parallel agents duplicate work, leave gaps, or misread
+the task, and the ambiguity is copied into every slice.² ³ Every brief has:
+
+1. **Objective:** one paragraph, what done looks like.
+2. **Owned paths:** one owner per file (fan-out section 1).
+3. **Inputs:** the selected context from section 2, and where to look.
+4. **Tool guidance:** which tools and sources fit (graft before grep, the
+   KB before the web).²
+5. **Output format:** the report shape, `CHANGED:` / `SKIPPED:` / `NOTES:`.
+6. **Acceptance check:** the command or observation that proves it.
+7. **Boundaries:** the concurrency contract, and what is out of scope.
+8. **Names with ids (2026-10-23, from the load watcher):** wherever a brief, message or report names a Paseo
+   workspace, give the name the GUI shows (a workers window: `WORKERS <repo> (<work>)`; its tabs `worker <slice> <lead agent id>`) and its id (`wks_…`); for an agent, its agent id too. A GUI
+   rename makes a name alone unreliable, and an id alone is unreadable.
+9. **The delivery footer** ([docs/dispatch-footer.md](dispatch-footer.md)): where the report goes, the `.done`
+   marker, the last line `DONE`, `BLOCKED: …` or `NO-REPORT: …`, and rule 22's push-on-completion
+   `paseo send` (`done: <title>, <PR URL>` or status/report, with named ack; `bin/completion-notice`). Paste the filled contract into every Agent-tool
+   or `paseo run` brief (`{report}`, `{lead}`, `{done}`, `{inbox}`, `{replies}`). While `acp-dispatch` still exists,
+   `acp-dispatch footer --report PATH` can print a filled copy for prompts only — it is not a launch path and goes with
+   the Wave 6 shim deletion.
+
+On 2026-11-07 a live child launch confirmed that `paseo run --cwd DIR` alone inherited the parent's workspace
+and ignored the requested directory. A top-level run with `PASEO_WORKSPACE_ID` set also inherits that workspace.
+Ordinary dispatch must **reuse an existing workspace**: `paseo run --workspace wks_… --cwd DIR`, with
+`paseo workspace ls --json` validating the id and that workspace `cwd` realpath-matches `--cwd` before any paid
+run. With a caller, its verified inspect snapshot must expose a workspace id; missing metadata or an unreadable
+caller requires explicit `--workspace`. Only a run without `PASEO_AGENT_ID` may fall back to `PASEO_WORKSPACE_ID`.
+Native Paseo 0.15.3 `inspect --json` omitted workspace identity when checked on 2026-11-08, so agent-origin
+launches on that CLI need `--workspace`. Mint a workspace only with native `paseo workspace create` or
+`paseo run --new-workspace` (never via the transitional `acp-dispatch` shim). A lead's first launch of a run has no
+WORKERS window yet: `--new-workspace local --cwd DIR` (DIR the repo's primary checkout), check the returned `cwd`, then name
+the window `WORKERS <repo> (<work>)` and reuse it for every later launch; each tab is `worker <slice> <lead agent
+id>` (operator rulings 2026-11-13, `docs/workspace-layout.md`, `skills/fan-out` section 3; `bin/ade-worker-run` does it). Parent links
+remain intact. Never fix placement by restarting a healthy paid slice. Missing or mismatched metadata produces
+a placement warning on stderr while the already launched agent continues — treat placement as unverified until
+`cwd` / workspace id match.
+
+Minimal out-of-process launch shape (after `route_agent.py plan` / `route` and `load-watch admit`):
+
+```bash
+paseo run --provider PROVIDER/MODEL --no-wait \
+  --workspace wks_… --cwd ~/src/<repo> \
+  --label ade.kind=KIND --label ade.name=NAME --label ade.lead=LEAD \
+  "$(cat brief-with-footer.md)"
+# the lead's first launch has no WORKERS window yet: --new-workspace local --cwd ~/src/<repo> instead of --workspace
+```
+
+`--label ade.lead=LEAD` (the lead's own full agent id) is required: a top-level worker started with
+`env -u PASEO_AGENT_ID -u PASEO_AGENT_CWD -u PASEO_WORKSPACE_ID paseo run …` is not a descendant of the lead, and
+`bin/ade-auto-permit` approves its permission requests only through this label (audit reason `lead-label`;
+2026-11-13 incident: a worker without it stalled 1h40m on a Bash prompt). Its tab name carries the lead's id too
+(`worker <slice> <lead id>`; window names carry none, `docs/workspace-layout.md`); a handoff successor is a new lead and keeps its own placement.
+
+## 4. Size the run to the work
+
+1. **Scale slice count with complexity.** Anthropic's research system uses one
+   agent with 3-10 tool calls for a simple lookup, 2-4 for a comparison, and
+   more than 10 only for complex work with clearly divided responsibilities.
+   Its common early failure was overinvesting in simple queries.²
+2. **Cap the fan-out at what you can verify.** Verification, not generation,
+   is the bottleneck; more agents mean more diffs to review.³ ⁵ A wave is the
+   number of diffs the orchestrator can read properly before the next wave
+   lands.
+3. **One level of delegation.** Workers launch no agents; only the
+   orchestrator dispatches.⁵
+4. **Every dispatch passes the load gate before it starts** (`load-watch admit --wait N`, default
+   1800 s, exit 75 when the machine is still too hot; operator 2026-10-19), then its frontier, in-flight and per-wave
+   checks, which parallel launches re-check under a lock after writing their record. The gate only decides whether to
+   *start*: it never kills, throttles or slows running work.
+5. **Plan with the load in mind** (load watcher, 2026-10-23, after load reached 42-62 on 8 cores with swap at 90%
+   from three concurrent local pytest runs plus three dispatches): check `load-watch admit --json` before a large
+   fan-out; builds and tests only through `bg` or CI, never `BG_LOAD_WAIT=0`; **one local test run at a time**; no new
+   local pytest or dispatch while load per core is 1.5 or more (`uptime`).
+6. **Stagger sends to a working Claude agent** (PR 294, from the retired `helm` lead guide, 2026-11-06): one message
+   at a time, each gated on the target going idle (`paseo wait ID --json` reads `idle`, or `paseo agent inspect`),
+   sent in the background. Paseo replaces a Claude agent's current turn when a steer is declined (for example during
+   compaction). Use `--behavior steer` for notices that must interrupt a steerable running turn; a provider that cannot
+   steer must wait for idle — otherwise the running turn is replaced. A send that timed out waiting sent nothing: retry
+   next round.
+
+## 5. Failure handling: kill criteria in code
+
+1. **Classify the failure first**, from the exit code / JSON status and stderr, not by
+   rereading the whole log at frontier effort: quota or plan → the vendor's
+   sibling pool, then re-route; tooling → another vendor; the work itself →
+   the orchestrator looks; refused → another model or a reworded
+   authorization context. After `paseo wait` (and when reading the report / `.done` yourself), keep these
+   classification codes: 0 report delivered and ending in `DONE`; 1 report present but unfinished, or still running;
+   2 usage or a refused launch; 3 no report; 4 `BLOCKED` (or a pending permission); 5 pool unavailable before launch,
+   re-plan; 75 machine too hot (`load-watch admit`), nothing launched; 77 review-launch's tripwire; 124 timed out
+   waiting. Exit 0 is still not success: verify the diff, the tests and the report's content. Do not assume a shim
+   exit code — implement the classification by reading the artifacts.
+2. **Three attempts per slice, then stop and report.** The first run plus two
+   re-routes. A slice stuck on the same error after that goes to the operator
+   with the evidence, not to a fourth vendor.³
+3. **Never kill healthy running work** to re-route it: it is already paid
+   for.
+4. **Stop dependent mutations on failure (2026-10-25).** A tool result is not
+   a successful command: inspect `exit_code` after every edit, commit and push.
+   In a multi-step tool block, throw or return on a nonzero result before the
+   next mutation; with Python use `subprocess.run(..., check=True)`. A refused
+   edit or failed commit must never be followed by a push or a review brief
+   claiming the edit landed. Match only your own changelog entry, since other
+   agents may also have pending PR-number placeholders.
+5. **Never block on a job longer than about 2 minutes unless the next step
+   depends on its result (2026-11-02).** An agent sat 10+ minutes in a blocking
+   `wait` on `gh pr checks --watch` with nothing depending on it, and the
+   operator had to interrupt. **Why it is worse than idle: an agent inside a
+   long blocking wait never goes idle, so it cannot receive any peer
+   message** (Paseo queues a text for a working target until it has been quiet
+   for 2 s): it is deaf as well as silent. On 2026-11-02 the lead's messages sat queued
+   for hours behind such waits. Do other work; if there is none, end the turn with a status line (what
+   runs, where its log is, what to check next) and let the result wake you.
+6. **Never wait on CI** (`gh pr checks --watch`, `gh run watch`). Report
+   "CI running" with the run URL and stop: the lead reads CI, and its wait command is
+   `gh pr checks PR --watch --required` (since 2026-11-06); a merge-ready decision needs no agent parked on it.
+7. **One progress line per round in a fix-and-review loop**: the head sha and
+   the finding count (`round 3: head 1a2b3c4, 2 findings`). A long serial
+   loop that prints nothing looks the same as a hang to a human reading the
+   pane.
+8. **A reply that cannot be delivered because its target waits on a question
+   or permission card is the operator's to unblock** (2026-11-02: a message
+   waited 184 minutes behind a card). Check `paseo agent inspect` / `paseo permit ls`
+   before sending; do not treat a busy non-steerable target or a pending card as delivered.
+   The asks / questions-please plugins are the operator's inbox. Report the message as
+   held behind a card and move on; do not retry or poll it.
+
+## 5a. Messages between agents (AGENTS.md order 10, re-based 2026-11-09)
+
+1. Send with native `paseo send --json`. Shape: positional agent id (or unique shortId prefix — never a title)
+   plus `--prompt '…'` or `--prompt-file PATH` (not `--agent` / `--text`). Examples:
+   `paseo send --json --no-wait <id> --prompt '…'`, or a trailing message string where the installed CLI accepts it.
+   For owner / deadline / load-watch notices that must interrupt a steerable turn, add `--behavior steer`.
+2. **What counts as delivered**: a sourceless send (deadline, load-watch: no `$PASEO_AGENT_ID`) is delivered when
+   JSON `.status` is `sent` or `completed` only. An agent's send is **accepted** when Paseo queues it: agent-to-agent
+   messages report no later delivery, so only the peer's `ack <your id>` proves it. Treat any other `.status` (and a
+   pending card / non-steerable busy target from `paseo agent inspect`) as not delivered. `paseo send`'s own `$?` is
+   never read as delivery (it exits 0 for every status).
+3. Ask for the named ack whenever delivery matters: put `Please reply: ack <your id>` in the text and pass
+   `--no-wait` (without it a send to a busy peer blocked over nine minutes, 2026-11-08). Always ask on first contact;
+   read your own inbox for it; re-send when none arrives; report a peer you cannot reach to the operator.
+4. A reply written in your own turn reaches nobody: answer a peer by sending to it. A slice's channel back is its
+   report file; a mid-run nudge is `paseo send --json --no-wait <id> --prompt '…'` (plus the ack ask), not a shim
+   `tell` subcommand.
+
+5. **Push on completion (2026-11-09).** A delegated slice, once its report is finished and `.done` is touched, tells
+   its requester with `paseo send --json --no-wait` (never relay): two lines, `done: <title>, <PR URL>` (or
+   `done: <title>, <status>[, <report>]`) then `Please reply: ack <its id> <msg-id>`. The dispatch footer rule 22 and
+   `bin/completion-notice` hold the shape; `skills/fan-out` Collect expects it so the lead does not poll.
+   **Dual-route completion proof (operator ruling 2026-11-12):** Immediate prompt replies from a requester to a completing
+   worker trigger Paseo's `sendPreparedPromptToAgent` with `replaceRunning: true`, which cancels the worker's closing turn via
+   `cancelAgentRunBefore('replace') -> session.interrupt()`. On provider `antigravity`, this turn cancellation triggers a fatal
+   stream interruption error (`[System Error] The stream was interrupted. Please continue the task you were working on.`)
+   because the provider adapter expects `result.error === 'interrupted'` rather than Antigravity 1.5+'s message and marks the
+   agent `errored` (tracked upstream in https://github.com/getpaseo/paseo/issues/9498). To eliminate in-flight turn cancellation
+   while preserving AGENTS.md standing order 10's strict delivery proof, every completion notice uses BOTH routes:
+   (a) **Idle-gated prompt ack:** The worker ends its turn immediately after sending its completion notice (so it transitions
+       to `idle`). The lead checks `paseo agent inspect <worker-id> --json` and sends `ack <worker-id> <msg-id>` via `paseo send`
+       ONLY once the worker is `idle` (never into an active closing turn).
+   (b) **Atomic disk ack:** The lead atomically writes `<done-path>.ack` next to the worker's done file (via a temporary
+       file in the same directory, then atomic rename/replace).
+   Every completion notice and every ack carries a unique message ID (UUID) generated by `bin/completion-notice`, allowing
+   either side to deduplicate messages.
+   Lead-side helper: `bin/completion-notice --lead-ack --worker <id> --msg-id <uuid> --done <done-path>`.
+   Worker check: `bin/completion-notice --check-ack <done-path> [--msg-id <uuid>]`.
+
+The transitional `skills/session-finder/relay.py` shim remains until Wave 6 deletion (soft deadline 2026-11-20) —
+do not add new call sites.
+
+## 5b. Unattended issue → PR (from `docs/history/coding-factory.md`, 2026-09-21)
+
+The factory question was answered then: the trigger is a small GitHub Actions workflow on a label, the coder is a
+pool already paid for (Cursor Cloud through `bin/cursor-cloud`, or a local Paseo agent; the Copilot cloud agent was
+an option until the 2026-11-06 pool audit found no Copilot plan), and the
+gate is repository configuration. The gate exists since 2026-11-06 (PR-only master, the required `adversary-marker`
+status, the Tests checks); the trigger is not built. A PR such a coder opens is outside input until the owner edits
+its body (AGENTS.md, Trust).
+
+## 6. Checks: focused first, full suite before commit
+
+1. After a wave, run the cheap checks first: lint and type-check on changed
+   files, then the tests that cover the diff.¹
+2. **The full suite still runs, once, before any commit.** Focused checks
+   are an early warning, not a replacement.¹
+3. A check hook on task completion (lint plus tests before a task counts as
+   done) catches what a worker forgot.³
+4. **Verify-until-pass is not `37chengshan/goal-mode` (2026-11-10).** That
+   plugin auto-continues on self-report markers; it does not run an acceptance
+   command. Issue 284 #4 still needs an ADE-native verifyCmd path. Eval,
+   install probes, accept/reject: [docs/goal-mode-eval.md](goal-mode-eval.md).
+5. **Reuse CI and its watcher (2026-10-25).** Before manually dispatching a
+   workflow, check its triggers and existing runs for this branch and head.
+   When opening a PR will trigger the required checks, finish the pre-PR
+   review and use that automatic run rather than dispatching the same suite
+   first. Keep one watcher for the chosen run; record its PID and run ID so a
+   successor can reuse it. If an older watcher is redundant, stop that local
+   watcher only; cancelling an already running workflow requires the
+   operator's approval. Repeat tests only for changed code, failures or an
+   unresolved validation concern.
+
+## 7. Measure, or the savings are a guess
+
+1. Log, per slice: kind, vendor, model, tokens or cost (`paseo usage ls --json`, the provider's usage), attempts, and
+   whether the diff passed review unchanged. Write the calibrate row yourself (or keep reading bigteam `outcome`
+   records while the transitional shim's `outcome` subcommand still exists).
+2. Re-read that log before changing a capability profile in
+   `route_agent.py`; a profile change without evidence is a guess.
+3. The cost math in source 1 is modelled, not measured; use your own before
+   and after numbers.¹
+
+## Sources
+
+1. CyrilXBT, "Your coding agent is paying frontier prices for multiple choice
+   questions", 2026-10-09,
+   <https://x.com/cyrilXBT/status/2108693524900110515>, and the reply by
+   @AILoreWeaver on note selection.
+2. Anthropic, "How we built our multi-agent research system",
+   <https://www.anthropic.com/engineering/multi-agent-research-system>.
+3. Addy Osmani, "The Code Agent Orchestra", 2026-03-26,
+   <https://addyosmani.com/blog/code-agent-orchestra/>.
+4. Width.ai, "What Is Jev AI?",
+   <https://www.width.ai/post/what-is-jev-ai-typesafe>, summarising
+   TypeSafe's jev-1.13 jaggedness page,
+   <https://docs.typesafe.ai/model-jaggedness/jev-1.13>.
+5. Firecrawl, "Multi-Agent Orchestration With Codex",
+   <https://www.firecrawl.dev/blog/codex-multi-agent-orchestration>.
+6. Survey: "Dynamic Model Routing and Cascading for Efficient LLM
+   Inference", <https://arxiv.org/html/2603.04445v2> (uncertainty-based
+   routing and cascades, background for section 1).

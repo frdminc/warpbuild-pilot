@@ -1,0 +1,2048 @@
+#!/usr/bin/env -S python3 -I
+"""ade-merge-ready: classify / stacks / approve / merge-now / stack-rebase for the ADE merge gate (2026-11-10).
+
+  ade-merge-ready [--repo OWNER/NAME] [--min N] [--json]
+  ade-merge-ready stacks [--group NAME] [--bottoms-only] [--repo …] [--min N] [--json]
+  ade-merge-ready approve-paste [--base master] [--bottoms-only] [--repo …] [--min N]
+  ade-merge-ready approve-post --i-reviewed --yes [--bottoms-only] [--trigger-marker] …
+  ade-merge-ready retrigger-marker (--prs … | --bottoms-only | --class NAME) [--yes]
+  ade-merge-ready [classify|merge-now …] [--no-marker-dispatch] [--marker-grace SECONDS]
+                                         [--state-file PATH]   # missing-check self-heal, below
+  ade-merge-ready merge-now --prs N[,N…] [--yes]   # refuses unless adversary-marker success
+  ade-merge-ready stack-rebase --prs N[,N…] [--onto master] [--upstream REF]
+                               [--yes --repo-dir PATH]
+  ade-merge-ready --help
+
+Uses `gh` to list open PRs (number >= --min, default 327; list limit 500 so
+stack bottoms are not dropped when >100 PRs are open), their pytest-linux /
+adversary-marker checks. A live APPROVE is taken only from the
+`adversary-marker` check (the Action runs `bin/adversary_marker.py`'s
+attribution-aware `decide`: owner body editor / owner comment history). Raw
+markers in the body or comments are never enough on their own — that would
+count an outside author's or bot's same-head APPROVE. Classify / stacks /
+approve-paste / retrigger-marker never invent an APPROVE. `approve-paste`
+prints templates only (and warns: never paste them through herdr — herdr
+mangles `<!-- … -->`). `approve-post` posts those templates via the GitHub
+API (not herdr) **only** when the authenticated `gh` user is the repository
+owner and both `--i-reviewed` and `--yes` are set (dry-run otherwise).
+Default `--via auto`: owner-authored tips get a **body** append (today's gate
+counts body APPROVE on owner PRs; comments do not); outside tips get an issue
+**comment**. `--via body` / `--via comment` force one path. Never invents a
+head — each marker names the tip `headRefOid` just collected.
+`retrigger-marker` only runs `gh workflow run adversary-marker.yml -f pr=N`
+for selected open tips (dry-run unless `--yes`); it never posts markers and
+never merges. Require at least one of `--prs`, `--bottoms-only`, or
+`--class` so a bare invoke of *that* command cannot fire the Action on every
+open PR (the missing-check self-heal below is the one deliberate exception:
+a bare `classify` dispatches for tips with no marker check at all, once per head).
+**Marker self-heal (2026-11-12, PR #587: Tests passed on a force-pushed head but the
+`workflow_run`-triggered Action never produced an `adversary-marker` check, and
+a human ran `gh workflow run adversary-marker.yml -f pr=587`).** `classify` and
+`merge-now --yes` (only the PRs named by `--prs`) now do that dispatch themselves, once per head: when pytest-linux
+passed for the tip, there is **no** `adversary-marker` check at all (not pending,
+not failed) and pytest-linux completed more than `--marker-grace` seconds ago
+(default 180), the tool runs `gh workflow run adversary-marker.yml -f pr=N`,
+claims `repo#N@head` in a state file BEFORE dispatching (`--state-file` or
+`ADE_MERGE_READY_STATE`, default `~/.local/state/ade/merge-ready/marker-dispatch.json`,
+atomic write under an flock; a state file that cannot be written stops all
+dispatching) so the same head is not dispatched twice, and reports it. The
+grace may also come from `ADE_MERGE_READY_MARKER_GRACE` (finite, >= 0). Errors
+on one row never abort the command. It never writes or fakes a marker,
+never dispatches for a head whose check failed or is pending, and does not wait:
+the next `classify` / `merge-now` run sees the result. `--no-marker-dispatch`
+turns it off.
+
+`merge-now` is the only merge path here: it refuses unless classify is
+`merge_now` (pytest-linux pass **and** adversary-marker success on the tip
+head); dry-run unless `--yes`. Do not raw `gh pr merge` when
+adversary-marker is missing or failing (2026-11-10: #481 was merged that
+way by mistake).
+
+`stack-rebase` restacks selected open children after a bottom lands (or when
+the recorded base drifted): dry-run by default; `--yes` needs `--repo-dir`
+(a local clone), rebases onto the open parent's head branch when that parent
+is still listed, else onto `--onto` (default `master`) with
+`git rebase --onto` excluding the old parent tip (squash-merge safe),
+retargets `gh pr edit --base` when needed, `git push --force-with-lease`,
+refuses fork/cross-repo heads, and refuses (leaves the tip alone) on rebase
+conflicts. Never invents an APPROVE and never merges.
+
+`stacks` walks open PR base→same-repo head refs and prints bottom-up APPROVE
+order for named groups (install, claims, s1, wave6) with full tip SHAs for
+marker paste. Parent edges are qualified by head repository (not branch name
+alone); ambiguous same-name heads yield no parent (fail-safe). In the default
+all-groups view, wave6 prints stack bottoms only (docs on master); pass
+`--group wave6` for the full wave6 bottom-up chains.
+
+Classes:
+  merge_now       pytest-linux pass + adversary-marker success (attributed APPROVE)
+  needs_approve   pytest-linux pass, no attributed APPROVE (typical Wave 6 tip)
+  tests_pending   pytest-linux pending / missing
+  tests_fail      pytest-linux fail
+  conflicting     GitHub mergeable == CONFLICTING
+  other           anything else
+
+Exit: 0 always when listing succeeds; 2 usage / gh failure.
+Stdlib only.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import contextlib
+import fcntl
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from collections import defaultdict
+from typing import Any, Callable
+
+MARKER_RE = re.compile(
+    r"<!--\s*adversary-verdict:v1\s*(\{.*?\})\s*-->",
+    re.DOTALL,
+)
+SHA40 = re.compile(r"^[0-9a-f]{40}$")
+
+# Named operator stacks (2026-11-09). Matching is by live open branch/title;
+# order is always derived from each PR's baseRefName → same-repo headRefName
+# edge (see link_parents), never from a hardcoded PR number sequence (numbers
+# drift as tips land).
+STACK_GROUPS: dict[str, Callable[[dict[str, Any]], bool]] = {
+    "install": lambda r: bool(
+        re.search(r"ade-install|ade-update-check", r.get("branch") or "")
+        or re.search(r"\bade-install\b|\binstall:", (r.get("title") or ""), re.I)
+    ),
+    # claims W2–W4: plugin → W3 → W4 → W2-release (+ queue note PR).
+    "claims": lambda r: bool(
+        re.search(r"ade-claim|queue-claims-w2w4", r.get("branch") or "")
+        or re.search(r"\bade-claim\b", (r.get("title") or ""), re.I)
+    ),
+    # S1 load_effective chain (gates → route → more → context → secret/pr).
+    "s1": lambda r: bool(
+        (r.get("branch") or "").startswith("cursor/s1-")
+        or re.search(r"\bS1\b|load_effective", (r.get("title") or ""))
+    ),
+    "wave6": lambda r: bool(
+        re.search(r"wave6", r.get("branch") or "", re.I)
+        or re.search(r"\bwave\s*6\b|\bwave6\b", (r.get("title") or ""), re.I)
+    ),
+}
+STACK_GROUP_NAMES = tuple(STACK_GROUPS.keys())
+
+
+def die(msg: str, code: int = 2) -> int:
+    print(f"ade-merge-ready: {msg}", file=sys.stderr)
+    return code
+
+
+def run_gh(
+    gh: str,
+    args: list[str],
+    timeout: float = 120,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [gh, *args],
+        input=input_text,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=timeout,
+    )
+
+
+def parse_approves(text: str) -> list[str]:
+    """Full 40-hex APPROVE heads found as live markers (caller blanks fences if needed)."""
+    out: list[str] = []
+    for m in MARKER_RE.finditer(text or ""):
+        try:
+            obj = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            continue
+        if obj.get("verdict") != "APPROVE":
+            continue
+        head = obj.get("head")
+        if isinstance(head, str) and SHA40.fullmatch(head):
+            out.append(head)
+    return out
+
+
+def check_status(lines: str, name: str) -> str:
+    """Best-effort status from `gh pr checks` TSV (name\\tstatus\\t...)."""
+    for line in (lines or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        if parts[0] == name:
+            return parts[1].lower()
+    return "missing"
+
+
+def classify(
+    *,
+    mergeable: str | None,
+    tests: str,
+    adv: str,
+    live_approve: bool,
+) -> str:
+    if (mergeable or "").upper() == "CONFLICTING":
+        return "conflicting"
+    if tests in ("fail", "failure", "cancelled", "canceled"):
+        return "tests_fail"
+    if tests not in ("pass", "success"):
+        return "tests_pending"
+    if live_approve and adv in ("pass", "success"):
+        return "merge_now"
+    if live_approve:
+        return "needs_approve"  # rare: APPROVE present but marker Action not green
+    return "needs_approve"
+
+
+def head_repository_nwo(pr: dict[str, Any], listing_repo: str) -> str:
+    """OWNER/NAME of the PR head, from gh JSON; empty when cross-repo and unknown.
+
+    Prefers headRepository.nameWithOwner, then headRepositoryOwner.login +
+    headRepository.name. Same-repo heads with no identity fields default to
+    listing_repo. A cross-repo head without identity returns "" so it can never
+    be chosen as a stack parent (fail closed on incomplete fork metadata).
+    """
+    hr = pr.get("headRepository")
+    if isinstance(hr, dict):
+        nwo = hr.get("nameWithOwner")
+        if isinstance(nwo, str) and "/" in nwo:
+            return nwo
+        name = hr.get("name")
+        owner_obj = pr.get("headRepositoryOwner")
+        login = owner_obj.get("login") if isinstance(owner_obj, dict) else None
+        if isinstance(login, str) and login and isinstance(name, str) and name:
+            return f"{login}/{name}"
+    if pr.get("isCrossRepository") is True:
+        return ""
+    return listing_repo
+
+
+def collect(gh: str, repo: str, min_n: int) -> list[dict[str, Any]]:
+    # Open count can exceed 100 (2026-11-10: 151); a hard 100 dropped stack
+    # bottoms (#334–#368) from classify/stacks paste output. Cap high enough
+    # for this repo; still fail closed if gh truncates silently (we cannot
+    # see a next page without GraphQL).
+    try:
+        owner = repo_owner_login(gh, repo)
+    except RuntimeError:
+        owner = ""
+    listing = run_gh(
+        gh,
+        [
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "open",
+            "--limit",
+            "500",
+            "--json",
+            "number,title,headRefOid,baseRefName,mergeable,headRefName,"
+            "headRepository,headRepositoryOwner,isCrossRepository,author",
+        ],
+    )
+    if listing.returncode != 0:
+        raise RuntimeError(listing.stderr.strip()[:300] or "gh pr list failed")
+    try:
+        prs = json.loads(listing.stdout or "[]")
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"gh pr list JSON: {e}") from e
+    if len(prs) >= 500:
+        raise RuntimeError(
+            "gh pr list returned 500 open PRs (tool limit); "
+            "raise --limit / paginate before trusting classify/stacks"
+        )
+
+    rows: list[dict[str, Any]] = []
+    for p in prs:
+        n = int(p["number"])
+        if n < min_n:
+            continue
+        head = p.get("headRefOid") or ""
+        author = ""
+        auth = p.get("author")
+        if isinstance(auth, dict):
+            author = (auth.get("login") or "").strip()
+        elif isinstance(auth, str):
+            author = auth.strip()
+        owner_pr = bool(author) and bool(owner) and author.lower() == owner.lower()
+        checks = run_gh(gh, ["pr", "checks", str(n), "--repo", repo])
+        # gh pr checks exits 1 when any check failed; stdout still usable
+        check_text = checks.stdout or ""
+        tests = check_status(check_text, "pytest-linux")
+        adv = check_status(check_text, "adversary-marker")
+
+        # Attribution lives in adversary-marker (bin/adversary_marker.py decide),
+        # not in an unfiltered body/comment scan. A raw same-head APPROVE from an
+        # outside author or bot must not flip live_approve / merge_now.
+        live = adv in ("pass", "success")
+
+        klass = classify(
+            mergeable=p.get("mergeable"),
+            tests=tests,
+            adv=adv,
+            live_approve=live,
+        )
+        rows.append(
+            {
+                "number": n,
+                "title": p.get("title") or "",
+                "head": head,
+                "base": p.get("baseRefName") or "",
+                "branch": p.get("headRefName") or "",
+                "author": author,
+                "owner_pr": owner_pr,
+                "head_repo": head_repository_nwo(p, repo),
+                "listing_repo": repo,
+                "mergeable": p.get("mergeable"),
+                "pytest_linux": tests,
+                "adversary_marker": adv,
+                "live_approve": live,
+                "class": klass,
+                "marker_template": (
+                    f'<!-- adversary-verdict:v1 {{"verdict":"APPROVE","head":"{head}"}} -->'
+                    if head and SHA40.fullmatch(head)
+                    else ""
+                ),
+            }
+        )
+    rows.sort(key=lambda r: r["number"])
+    return rows
+
+
+def link_parents(
+    rows: list[dict[str, Any]], listing_repo: str | None = None
+) -> list[dict[str, Any]]:
+    """Attach parent_number from open-PR baseRefName → same-repo headRefName.
+
+    Parent lookup is qualified by head repository (prefer
+    ``headRepository.nameWithOwner`` / owner+name from gh JSON), not by branch
+    name alone. A fork PR whose head branch is ``master`` must not become the
+    parent of every PR targeting the listing repo's ``master``.
+
+    Only heads whose ``head_repo`` equals the listing repo are candidates. If
+    two open same-repo PRs share a ``headRefName``, ``parent_number`` stays
+    ``None`` (fail-safe: never guess which one is the stack parent).
+    """
+    repo = listing_repo or ""
+    if not repo:
+        for r in rows:
+            lr = r.get("listing_repo")
+            if isinstance(lr, str) and lr:
+                repo = lr
+                break
+    by_branch: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        branch = r.get("branch") or ""
+        if not branch:
+            continue
+        head_repo = r.get("head_repo") or ""
+        if not repo:
+            # No listing identity: still require a unique headRefName among all
+            # rows, never last-wins overwrite.
+            by_branch[branch].append(r)
+            continue
+        if head_repo != repo:
+            continue
+        by_branch[branch].append(r)
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        base = r.get("base") or ""
+        candidates = by_branch.get(base, [])
+        linked = dict(r)
+        # Fail-safe: unique exact headRefName match only; 0 or 2+ → no parent.
+        linked["parent_number"] = (
+            candidates[0]["number"] if len(candidates) == 1 else None
+        )
+        out.append(linked)
+    return out
+
+
+def expand_with_ancestors(
+    selected: list[dict[str, Any]], all_rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Keep stack integrity: if a tip matches a group, include its open ancestors."""
+    by_num = {r["number"]: r for r in all_rows}
+    keep: set[int] = {r["number"] for r in selected}
+    for r in selected:
+        cur = r
+        while cur.get("parent_number") is not None:
+            parent = by_num.get(cur["parent_number"])
+            if parent is None or parent["number"] in keep:
+                break
+            keep.add(parent["number"])
+            cur = parent
+    return [by_num[n] for n in sorted(keep)]
+
+
+def bottom_up_order(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Topological order: stack bottoms (no open parent in set) first, then children.
+
+    Sibling branches at the same depth stay in PR-number order. Cycles (should not
+    happen for GitHub base refs) fall back to number order for the remainder.
+    """
+    by_num = {r["number"]: r for r in rows}
+    nums = set(by_num)
+    children: dict[int | None, list[int]] = defaultdict(list)
+    indeg: dict[int, int] = {n: 0 for n in nums}
+    for r in rows:
+        p = r.get("parent_number")
+        if p in nums:
+            children[p].append(r["number"])
+            indeg[r["number"]] += 1
+
+    for k in children:
+        children[k].sort()
+
+    ordered: list[dict[str, Any]] = []
+    queue = sorted(n for n, d in indeg.items() if d == 0)
+    seen: set[int] = set()
+    while queue:
+        n = queue.pop(0)
+        if n in seen:
+            continue
+        seen.add(n)
+        ordered.append(by_num[n])
+        for c in children.get(n, []):
+            indeg[c] -= 1
+            if indeg[c] == 0:
+                queue.append(c)
+                queue.sort()
+    if len(ordered) < len(rows):
+        for n in sorted(nums - seen):
+            ordered.append(by_num[n])
+    return ordered
+
+
+def stack_bottoms(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """PRs whose open parent is outside this set (typically base=master)."""
+    nums = {r["number"] for r in rows}
+    bottoms = [
+        r for r in rows if r.get("parent_number") is None or r["parent_number"] not in nums
+    ]
+    return sorted(bottoms, key=lambda r: r["number"])
+
+
+def build_named_stacks(
+    rows: list[dict[str, Any]],
+    *,
+    groups: list[str] | None = None,
+    bottoms_only: bool = False,
+    listing_repo: str | None = None,
+) -> list[dict[str, Any]]:
+    linked = link_parents(rows, listing_repo=listing_repo)
+    explicit = groups is not None
+    names = list(groups) if explicit else list(STACK_GROUP_NAMES)
+    stacks: list[dict[str, Any]] = []
+    for name in names:
+        matcher = STACK_GROUPS[name]
+        matched = [r for r in linked if matcher(r)]
+        if not matched:
+            stacks.append({"group": name, "bottoms_only": False, "order": []})
+            continue
+        # Default all-groups view: wave6 shows docs bottoms only. Explicit
+        # `--group wave6` prints the full bottom-up chains unless --bottoms-only.
+        # Bottoms use the matched set only so a non-group open base (e.g. S1
+        # #332 under wave6-gates-doc) is not itself listed as a wave6 bottom.
+        want_bottoms = bottoms_only or (not explicit and name == "wave6")
+        if want_bottoms:
+            order = stack_bottoms(matched)
+        else:
+            order = bottom_up_order(expand_with_ancestors(matched, linked))
+        stacks.append(
+            {
+                "group": name,
+                "bottoms_only": want_bottoms,
+                "order": order,
+            }
+        )
+    return stacks
+
+
+def print_table(rows: list[dict[str, Any]]) -> None:
+    print(
+        f"{'N':<5} {'class':<14} {'tests':<10} {'adv':<10} {'approve':<7} {'head':<10} title"
+    )
+    for r in rows:
+        print(
+            f"{r['number']:<5} {r['class']:<14} {r['pytest_linux']:<10} "
+            f"{r['adversary_marker']:<10} {str(r['live_approve']):<7} "
+            f"{(r['head'] or '')[:7]:<10} {(r['title'] or '')[:48]}"
+        )
+    needs = [
+        r
+        for r in rows
+        if r["class"] == "needs_approve" and r["pytest_linux"] in ("pass", "success")
+    ]
+    if needs:
+        print()
+        print_approve_paste(needs)
+
+
+def print_approve_paste(rows: list[dict[str, Any]]) -> None:
+    """Emit every paste-ready marker (no truncation); operator posts after review."""
+    print(
+        "# Paste-ready APPROVE templates "
+        "(operator only; after a real review of that head):"
+    )
+    print(
+        "# WARNING: do not paste through herdr — it rewrites "
+        "`<!-- adversary-verdict:v1 … -->` into "
+        "`<-- env … herdr --session adversary-verdict:v1 … -->`, "
+        "so the gate never sees a live marker."
+    )
+    print(
+        "# Prefer: bin/ade-merge-ready approve-post --via auto "
+        "(GitHub API, not herdr; outside tips → owner comment)."
+    )
+    print(
+        "# Owner tips (after #484 on master): no APPROVE paste — Tests / push "
+        "rejudge flips adversary-marker; use merge-now. Outside tips still need "
+        "an owner comment (+ approve-post or dispatch)."
+    )
+    for r in rows:
+        head = r.get("head") or ""
+        tmpl = r.get("marker_template") or ""
+        if not tmpl:
+            continue
+        print(f"# PR {r['number']} ({head[:7]}) base={r.get('base') or '?'}")
+        print(tmpl)
+
+
+def select_approve_rows(
+    rows: list[dict[str, Any]],
+    *,
+    base: str,
+    bottoms_only: bool,
+    groups: list[str] | None,
+    listing_repo: str,
+    pr_numbers: set[int] | None = None,
+) -> list[dict[str, Any]]:
+    """needs_approve + green pytest-linux rows, optionally filtered like approve-paste."""
+    paste_rows = [
+        r
+        for r in rows
+        if r["class"] == "needs_approve"
+        and r["pytest_linux"] in ("pass", "success")
+        and r.get("marker_template")
+        and SHA40.match(r.get("head") or "")
+    ]
+    if base:
+        paste_rows = [r for r in paste_rows if r.get("base") == base]
+    if bottoms_only or groups:
+        stacks = build_named_stacks(
+            rows,
+            groups=groups,
+            bottoms_only=True,
+            listing_repo=listing_repo,
+        )
+        bottom_nums = {r["number"] for s in stacks for r in (s.get("order") or [])}
+        paste_rows = [r for r in paste_rows if r["number"] in bottom_nums]
+    if pr_numbers is not None:
+        paste_rows = [r for r in paste_rows if r["number"] in pr_numbers]
+    paste_rows.sort(key=lambda r: r["number"])
+    return paste_rows
+
+
+def gh_login(gh: str) -> str:
+    p = run_gh(gh, ["api", "user", "-q", ".login"], timeout=30)
+    if p.returncode != 0:
+        raise RuntimeError(f"gh api user failed: {(p.stderr or p.stdout).strip()}")
+    login = (p.stdout or "").strip()
+    if not login:
+        raise RuntimeError("gh api user returned empty login")
+    return login
+
+
+def repo_owner_login(gh: str, repo: str) -> str:
+    p = run_gh(
+        gh,
+        ["repo", "view", repo, "--json", "owner", "-q", ".owner.login"],
+        timeout=30,
+    )
+    if p.returncode != 0:
+        raise RuntimeError(f"gh repo view {repo} failed: {(p.stderr or p.stdout).strip()}")
+    owner = (p.stdout or "").strip()
+    if not owner:
+        raise RuntimeError(f"gh repo view {repo} returned empty owner")
+    return owner
+
+
+def _approve_marker(head: str) -> str:
+    return f'<!-- adversary-verdict:v1 {{"verdict":"APPROVE","head":"{head}"}} -->'
+
+
+def _trigger_adversary_marker(
+    gh: str, repo: str, number: int, *, progress=None
+) -> None:
+    out = progress if progress is not None else sys.stdout
+    t = run_gh(
+        gh,
+        [
+            "workflow",
+            "run",
+            "adversary-marker.yml",
+            "--repo",
+            repo,
+            "-f",
+            f"pr={number}",
+        ],
+        timeout=60,
+    )
+    if t.returncode != 0:
+        raise RuntimeError(
+            f"workflow run adversary-marker pr={number} failed: "
+            f"{(t.stderr or t.stdout).strip()}"
+        )
+    print(f"triggered adversary-marker.yml pr={number}", file=out)
+
+
+DEFAULT_MARKER_GRACE = 180  # seconds after pytest-linux completed (2026-11-12)
+STATE_KEEP_SECONDS = 30 * 86400
+
+
+def _grace_arg(value: str) -> float:
+    try:
+        g = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {value!r}") from None
+    if not math.isfinite(g) or g < 0:
+        raise argparse.ArgumentTypeError(f"must be a finite number >= 0 (got {value!r})")
+    return g
+
+
+def default_state_path() -> str:
+    env = os.environ.get("ADE_MERGE_READY_STATE", "").strip()
+    if env:
+        return env
+    return os.path.join(
+        os.path.expanduser("~"),
+        ".local",
+        "state",
+        "ade",
+        "merge-ready",
+        "marker-dispatch.json",
+    )
+
+
+def load_dispatch_state(path: str) -> dict[str, float]:
+    """{repo#N@head: epoch} of heads already re-dispatched; unreadable file = empty."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+        raw = doc.get("dispatched") if isinstance(doc, dict) else None
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            str(k): float(v)
+            for k, v in raw.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        }
+    except (OSError, ValueError, OverflowError):  # corrupt file = no record
+        return {}
+
+
+def save_dispatch_state(path: str, state: dict[str, float], now: float) -> None:
+    """Atomic write (temp alongside, then os.replace); drops entries older than 30 days."""
+    keep = {k: v for k, v in state.items() if now - v <= STATE_KEEP_SECONDS}
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".marker-dispatch-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"dispatched": keep}, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def tests_completed_epoch(gh: str, repo: str, number: int) -> float | None:
+    """Epoch when pytest-linux completed on the PR tip, or None when unknown (fail closed)."""
+    p = run_gh(
+        gh,
+        [
+            "pr",
+            "checks",
+            str(number),
+            "--repo",
+            repo,
+            "--json",
+            "name,bucket,completedAt",
+        ],
+        timeout=60,
+    )
+    # gh exits 1 when any check failed; stdout is still the JSON.
+    try:
+        doc = json.loads(p.stdout or "[]")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(doc, list):
+        return None
+    # A re-run or a second event can list pytest-linux twice: the NEWEST
+    # completed entry decides, and it must itself be a pass.
+    newest: tuple[float, str] | None = None
+    for c in doc:
+        if not isinstance(c, dict) or c.get("name") != "pytest-linux":
+            continue
+        raw = c.get("completedAt")
+        if not isinstance(raw, str) or not raw:
+            continue
+        try:
+            when = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if when.tzinfo is None:
+            continue
+        stamp = when.timestamp()
+        if newest is None or stamp > newest[0]:
+            newest = (stamp, str(c.get("bucket")))
+    if newest is None or newest[1] != "pass":
+        return None
+    return newest[0]
+
+
+@contextlib.contextmanager
+def _state_lock(state_path: str):
+    """Exclusive flock on a sidecar file so concurrent runs cannot both dispatch a head."""
+    directory = os.path.dirname(os.path.abspath(state_path))
+    os.makedirs(directory, exist_ok=True)
+    fd = os.open(state_path + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _current_head(gh: str, repo: str, number: int) -> str:
+    p = run_gh(
+        gh,
+        ["pr", "view", str(number), "--repo", repo, "--json", "headRefOid"],
+        timeout=60,
+    )
+    if p.returncode != 0:
+        return ""
+    try:
+        doc = json.loads(p.stdout or "{}")
+    except json.JSONDecodeError:
+        return ""
+    head = doc.get("headRefOid") if isinstance(doc, dict) else ""
+    return head if isinstance(head, str) else ""
+
+
+def heal_missing_markers(
+    gh: str,
+    repo: str,
+    rows: list[dict[str, Any]],
+    *,
+    grace: float,
+    state_path: str,
+    now: float | None = None,
+    progress=None,
+) -> list[dict[str, Any]]:
+    """Dispatch adversary-marker.yml once per head whose check never appeared.
+
+    Eligible: class needs_approve, pytest-linux pass, adversary-marker check
+    *missing* (a pending or failed check is never touched), 40-hex head, and
+    pytest-linux completed more than ``grace`` seconds ago. Never writes a
+    marker. Best effort: a failure on one row is reported on that row and never
+    aborts the command. The head is claimed in the state file (under an flock)
+    BEFORE the dispatch and released again if the dispatch fails, so a state
+    file that cannot be written stops all dispatching instead of repeating it.
+    Sets ``row["marker_dispatch"]`` and returns one report per candidate.
+    """
+    out = progress if progress is not None else sys.stdout
+    ts = time.time() if now is None else now
+    reports: list[dict[str, Any]] = []
+    candidates = [
+        r
+        for r in rows
+        if r.get("class") == "needs_approve"
+        and r.get("pytest_linux") in ("pass", "success")
+        and r.get("adversary_marker") == "missing"
+        and SHA40.fullmatch(r.get("head") or "")
+    ]
+    if not candidates:
+        return reports
+    try:
+        lock = _state_lock(state_path)
+        lock.__enter__()
+    except OSError as e:
+        for r in candidates:
+            r["marker_dispatch"] = "state_unwritable"
+            reports.append({"number": int(r["number"]), "action": "state_unwritable"})
+        print(f"marker-dispatch: state file unusable, not dispatching ({e})", file=out)
+        return reports
+    try:
+        state = load_dispatch_state(state_path)
+        writable = True
+        for r in candidates:
+            head = r["head"]
+            n = int(r["number"])
+            key = f"{repo}#{n}@{head}"
+            report: dict[str, Any] = {"number": n, "head": head}
+            try:
+                if key in state:
+                    report["action"] = "already_dispatched"
+                elif not writable:
+                    report["action"] = "state_unwritable"
+                else:
+                    done = tests_completed_epoch(gh, repo, n)
+                    if done is None:
+                        report["action"] = "unknown_tests_time"
+                    elif ts - done < grace:
+                        report["action"] = "waiting"
+                        report["wait_seconds"] = int(grace - (ts - done)) + 1
+                    elif _current_head(gh, repo, n) != head:
+                        report["action"] = "head_moved"
+                    else:
+                        state[key] = ts
+                        try:
+                            save_dispatch_state(state_path, state, ts)
+                        except OSError as e:
+                            del state[key]
+                            writable = False
+                            report["action"] = "state_unwritable"
+                            report["detail"] = str(e)[:200]
+                        else:
+                            try:
+                                _trigger_adversary_marker(gh, repo, n, progress=out)
+                            except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
+                                del state[key]
+                                report["action"] = "dispatch_failed"
+                                report["detail"] = str(e)[:300]
+                                try:
+                                    save_dispatch_state(state_path, state, ts)
+                                except OSError as e2:
+                                    report["detail"] += (
+                                        f"; claim NOT released ({str(e2)[:120]}), "
+                                        "this head will not be retried"
+                                    )
+                            else:
+                                report["action"] = "dispatched"
+            except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
+                report["action"] = "error"
+                report["detail"] = str(e)[:300]
+            r["marker_dispatch"] = report["action"]
+            reports.append(report)
+            if report["action"] == "already_dispatched":
+                continue
+            note = {
+                "dispatched": "dispatched adversary-marker.yml (check never appeared; "
+                "re-run this command to read the result)",
+                "waiting": f"within grace; check again in ~{report.get('wait_seconds', 0)}s",
+                "unknown_tests_time": "pytest-linux completion time unknown; not dispatching",
+                "head_moved": "head moved since listing; not dispatching",
+                "state_unwritable": "state file not writable; not dispatching "
+                f"({report.get('detail', '')})",
+                "dispatch_failed": f"dispatch failed: {report.get('detail', '')}",
+                "error": f"error: {report.get('detail', '')}",
+            }[report["action"]]
+            print(f"marker-dispatch #{n} ({head[:7]}): {note}", file=out)
+    finally:
+        lock.__exit__(None, None, None)
+    return reports
+
+
+CLASS_NAMES = (
+    "merge_now",
+    "needs_approve",
+    "tests_pending",
+    "tests_fail",
+    "conflicting",
+    "other",
+)
+
+
+def select_retrigger_rows(
+    rows: list[dict[str, Any]],
+    *,
+    bottoms_only: bool,
+    groups: list[str] | None,
+    listing_repo: str,
+    pr_numbers: set[int] | None = None,
+    class_name: str | None = None,
+) -> list[dict[str, Any]]:
+    """Open tips selected for adversary-marker re-run (never invents APPROVE).
+
+    Filters combine with AND. ``--bottoms-only`` without ``--group`` keeps
+    stack bottoms of the full open set (base outside the open graph). With
+    ``--group``, bottoms follow the same named-stack set as approve-*.
+    """
+    selected = list(rows)
+    if class_name:
+        selected = [r for r in selected if r.get("class") == class_name]
+    if bottoms_only or groups:
+        if groups:
+            stacks = build_named_stacks(
+                rows,
+                groups=groups,
+                bottoms_only=True,
+                listing_repo=listing_repo,
+            )
+            bottom_nums = {
+                r["number"] for s in stacks for r in (s.get("order") or [])
+            }
+        else:
+            linked = link_parents(rows, listing_repo=listing_repo)
+            bottom_nums = {r["number"] for r in stack_bottoms(linked)}
+        selected = [r for r in selected if r["number"] in bottom_nums]
+    if pr_numbers is not None:
+        selected = [r for r in selected if r["number"] in pr_numbers]
+    selected.sort(key=lambda r: r["number"])
+    return selected
+
+
+def retrigger_marker_prs(
+    gh: str,
+    repo: str,
+    rows: list[dict[str, Any]],
+    *,
+    dry_run: bool,
+    progress=None,
+) -> list[int]:
+    """Dry-run or fire ``adversary-marker.yml`` for each selected tip. No merge."""
+    out = progress if progress is not None else sys.stdout
+    fired: list[int] = []
+    for r in rows:
+        n = int(r["number"])
+        if dry_run:
+            print(f"would trigger adversary-marker.yml pr={n}", file=out)
+        else:
+            _trigger_adversary_marker(gh, repo, n, progress=out)
+        fired.append(n)
+    return fired
+
+
+def resolve_approve_via(via: str, owner_pr: bool) -> str:
+    """Return 'body' or 'comment' for one tip under --via auto|body|comment."""
+    v = (via or "auto").strip().lower()
+    if v == "auto":
+        return "body" if owner_pr else "comment"
+    if v in ("body", "comment"):
+        return v
+    raise RuntimeError(f"unknown --via {via!r} (want auto|body|comment)")
+
+
+def parse_expect_heads(items: list[str]) -> dict[int, str]:
+    """Parse --expect-head N=40hex / N:40hex into {pr: sha}."""
+    out: dict[int, str] = {}
+    for raw in items or []:
+        s = (raw or "").strip()
+        if not s:
+            continue
+        if "=" in s:
+            left, right = s.split("=", 1)
+        elif ":" in s:
+            left, right = s.split(":", 1)
+        else:
+            raise RuntimeError(
+                f"bad --expect-head {raw!r} (want N=40hex or N:40hex)"
+            )
+        try:
+            n = int(left.strip())
+        except ValueError as e:
+            raise RuntimeError(
+                f"bad --expect-head {raw!r}: PR number must be int"
+            ) from e
+        sha = right.strip().lower()
+        if not SHA40.fullmatch(sha):
+            raise RuntimeError(
+                f"bad --expect-head {raw!r}: head must be a 40-hex sha"
+            )
+        out[n] = sha
+    return out
+
+
+def require_expect_heads(
+    paste_rows: list[dict[str, Any]], expect: dict[int, str]
+) -> None:
+    """Refuse --yes when a tip's live head is missing from or differs from expect."""
+    if not expect:
+        raise RuntimeError(
+            "approve-post --yes requires --expect-head N=40hex for each tip "
+            "(pin the SHA you reviewed; dry-run prints them)"
+        )
+    for r in paste_rows:
+        n = int(r["number"])
+        live = (r.get("head") or "").lower()
+        want = expect.get(n)
+        if want is None:
+            raise RuntimeError(
+                f"approve-post --yes missing --expect-head {n}={live or '…'}"
+            )
+        if want != live:
+            raise RuntimeError(
+                f"#{n} live head {live} != --expect-head {want} "
+                "(tip moved after review; re-review and pin the new sha)"
+            )
+
+
+def post_approve_comment(
+    gh: str,
+    repo: str,
+    number: int,
+    head: str,
+    *,
+    dry_run: bool,
+    trigger_marker: bool,
+    progress=None,
+) -> None:
+    """Post one owner APPROVE comment naming *head*; optionally re-run the marker Action."""
+    out = progress if progress is not None else sys.stdout
+    marker = _approve_marker(head)
+    if dry_run:
+        print(f"would comment #{number} head={head}", file=out)
+        print(marker, file=out)
+        if trigger_marker:
+            print(f"would trigger adversary-marker.yml pr={number}", file=out)
+        return
+    p = run_gh(
+        gh,
+        ["pr", "comment", str(number), "--repo", repo, "--body", marker],
+        timeout=60,
+    )
+    if p.returncode != 0:
+        raise RuntimeError(
+            f"gh pr comment #{number} failed: {(p.stderr or p.stdout).strip()}"
+        )
+    print(f"commented #{number} head={head}", file=out)
+    if trigger_marker:
+        _trigger_adversary_marker(gh, repo, number, progress=out)
+
+
+def post_approve_body(
+    gh: str,
+    repo: str,
+    number: int,
+    head: str,
+    *,
+    dry_run: bool,
+    trigger_marker: bool,
+    progress=None,
+) -> None:
+    """Append one APPROVE marker to the PR body (owner tips; not herdr)."""
+    out = progress if progress is not None else sys.stdout
+    marker = _approve_marker(head)
+    if dry_run:
+        print(f"would body-edit #{number} head={head}", file=out)
+        print(marker, file=out)
+        if trigger_marker:
+            print(f"would trigger adversary-marker.yml pr={number}", file=out)
+        return
+    view = run_gh(
+        gh,
+        ["pr", "view", str(number), "--repo", repo, "--json", "body"],
+        timeout=60,
+    )
+    if view.returncode != 0:
+        raise RuntimeError(
+            f"gh pr view #{number} failed: {(view.stderr or view.stdout).strip()}"
+        )
+    try:
+        cur = json.loads(view.stdout or "{}")
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"gh pr view #{number} JSON: {e}") from e
+    old = cur.get("body") or ""
+    if marker in old:
+        print(f"body already has marker #{number} head={head}", file=out)
+    else:
+        new_body = old.rstrip() + "\n\n" + marker + "\n"
+        # Prefer REST JSON body to avoid shell metacharacters in markers.
+        patch = run_gh(
+            gh,
+            [
+                "api",
+                "--method",
+                "PATCH",
+                f"repos/{repo}/pulls/{number}",
+                "--input",
+                "-",
+            ],
+            timeout=60,
+            input_text=json.dumps({"body": new_body}),
+        )
+        if patch.returncode != 0:
+            raise RuntimeError(
+                f"gh api PATCH pulls/{number} failed: "
+                f"{(patch.stderr or patch.stdout).strip()}"
+            )
+        print(f"body-edited #{number} head={head}", file=out)
+    if trigger_marker:
+        _trigger_adversary_marker(gh, repo, number, progress=out)
+
+
+def _merge_async_squash(gh: str, repo: str, number: int, head: str) -> None:
+    """Squash-merge via PUT …/merge-async (required for GitHub native stacks)."""
+    body = json.dumps(
+        {
+            "merge_method": "squash",
+            "merge_action": "direct_merge",
+            "sha": head,
+        }
+    )
+    p = run_gh(
+        gh,
+        [
+            "api",
+            "-X",
+            "PUT",
+            f"repos/{repo}/pulls/{number}/merge-async",
+            "--input",
+            "-",
+        ],
+        timeout=60,
+        input_text=body,
+    )
+    if p.returncode != 0:
+        raise RuntimeError(
+            f"merge-async #{number} failed: {(p.stderr or p.stdout).strip()}"
+        )
+    try:
+        doc = json.loads(p.stdout)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"merge-async #{number}: bad JSON: {e}") from e
+    status = doc.get("status")
+    details = doc.get("details") if isinstance(doc.get("details"), dict) else {}
+    if status == "merged":
+        return
+    if status == "failed":
+        raise RuntimeError(
+            f"merge-async #{number} failed: {details.get('message') or doc}"
+        )
+    uuid = details.get("uuid")
+    if status != "pending" or not isinstance(uuid, str) or not uuid:
+        raise RuntimeError(f"merge-async #{number}: unexpected response {doc}")
+    for _ in range(40):
+        time.sleep(3)
+        q = run_gh(
+            gh,
+            ["api", f"repos/{repo}/pulls/{number}/merge-async/{uuid}"],
+            timeout=60,
+        )
+        if q.returncode != 0:
+            raise RuntimeError(
+                f"merge-async #{number} poll failed: {(q.stderr or q.stdout).strip()}"
+            )
+        try:
+            qd = json.loads(q.stdout)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"merge-async #{number} poll: bad JSON: {e}") from e
+        st = qd.get("status")
+        qdet = qd.get("details") if isinstance(qd.get("details"), dict) else {}
+        if st == "merged":
+            return
+        if st == "enqueued":
+            return
+        if st == "failed":
+            raise RuntimeError(
+                f"merge-async #{number} failed: {qdet.get('message') or qd}"
+            )
+    raise RuntimeError(f"merge-async #{number} timed out uuid={uuid}")
+
+
+def plan_stack_rebase(
+    rows: list[dict[str, Any]],
+    pr_numbers: set[int],
+    *,
+    onto: str = "master",
+    listing_repo: str | None = None,
+    upstream_override: str | None = None,
+) -> list[dict[str, Any]]:
+    """Bottom-up rebase plan for selected open tips (no git yet).
+
+    Open parent → onto that parent's headRefName. Else → ``onto`` (usually
+    master after the parent merged). ``need_base_edit`` when GitHub's
+    baseRefName differs from the chosen onto.
+
+    After a squash-merged parent, ``upstream_exclude`` is the old parent
+    branch (still named in ``base`` when GitHub has not retargeted yet) so
+    ``git rebase --onto <onto> <upstream_exclude>`` replays only child
+    commits. Fork / cross-repo heads are refused.
+    """
+    onto = (onto or "master").strip()
+    if not onto or ".." in onto or onto.startswith("-") or "\n" in onto or " " in onto:
+        raise RuntimeError(f"invalid --onto {onto!r}")
+    up_over = (upstream_override or "").strip() or None
+    if up_over is not None and (
+        ".." in up_over or up_over.startswith("-") or "\n" in up_over or " " in up_over
+    ):
+        raise RuntimeError(f"invalid --upstream {up_over!r}")
+    linked = link_parents(rows, listing_repo=listing_repo)
+    by_n = {int(r["number"]): r for r in linked}
+    missing = sorted(n for n in pr_numbers if n not in by_n)
+    if missing:
+        raise RuntimeError(
+            f"#{missing[0]} not in open listing for this --repo/--min — refuse stack-rebase"
+        )
+    selected = [by_n[n] for n in sorted(pr_numbers)]
+    ordered = bottom_up_order(selected)
+    repo = listing_repo or ""
+    plans: list[dict[str, Any]] = []
+
+    def _refuse(
+        r: dict[str, Any],
+        *,
+        reason: str,
+        detail: str,
+        target: str,
+        parent_n: Any,
+    ) -> dict[str, Any]:
+        return {
+            "number": int(r["number"]),
+            "branch": str(r.get("branch") or ""),
+            "head": str(r.get("head") or ""),
+            "base": str(r.get("base") or ""),
+            "onto": target,
+            "need_base_edit": False,
+            "upstream_exclude": None,
+            "reason": reason,
+            "action": "refuse",
+            "parent_number": parent_n,
+            "class": r.get("class"),
+            "head_repo": r.get("head_repo") or "",
+            "detail": detail,
+        }
+
+    for r in ordered:
+        parent_n = r.get("parent_number")
+        base = str(r.get("base") or "")
+        branch = str(r.get("branch") or "")
+        head = str(r.get("head") or "")
+        head_repo = str(r.get("head_repo") or "")
+        if repo:
+            if not head_repo:
+                plans.append(
+                    _refuse(
+                        r,
+                        reason="unknown_head_repo",
+                        detail=(
+                            "missing head_repo; refuse fork-unsafe rebase "
+                            "(cannot verify head is this listing repo)"
+                        ),
+                        target=onto,
+                        parent_n=parent_n,
+                    )
+                )
+                continue
+            if head_repo != repo:
+                plans.append(
+                    _refuse(
+                        r,
+                        reason="cross_repo_head",
+                        detail=(
+                            f"head_repo={head_repo!r} != listing {repo!r}; "
+                            "refuse fork head (would rebase/push the wrong origin branch)"
+                        ),
+                        target=onto,
+                        parent_n=parent_n,
+                    )
+                )
+                continue
+        if not branch:
+            plans.append(
+                _refuse(
+                    r,
+                    reason="missing_head_ref",
+                    detail="missing headRefName",
+                    target=onto,
+                    parent_n=parent_n,
+                )
+            )
+            continue
+        upstream_exclude: str | None = None
+        if isinstance(parent_n, int) and parent_n in by_n:
+            parent = by_n[parent_n]
+            target = str(parent.get("branch") or "")
+            if not target:
+                plans.append(
+                    _refuse(
+                        r,
+                        reason="parent_missing_head_ref",
+                        detail=f"open parent #{parent_n} has no headRefName",
+                        target=onto,
+                        parent_n=parent_n,
+                    )
+                )
+                continue
+            reason = "open_parent"
+            # Parent tip is an ancestor of the child for commits shared with the
+            # parent; a plain rebase onto the parent tip only replays the child.
+        else:
+            target = onto
+            if base != onto:
+                reason = "parent_gone"
+                # Old base branch name is the squash-parent exclusion tip.
+                upstream_exclude = up_over or base
+            else:
+                reason = "align_onto"
+                if up_over:
+                    upstream_exclude = up_over
+                else:
+                    plans.append(
+                        _refuse(
+                            r,
+                            reason="align_onto_needs_upstream",
+                            detail=(
+                                "base already equals --onto after parent merge; "
+                                "pass --upstream <old-parent-tip-or-branch> so only "
+                                "child commits replay (squash-merge restack)"
+                            ),
+                            target=target,
+                            parent_n=parent_n,
+                        )
+                    )
+                    continue
+        plans.append(
+            {
+                "number": int(r["number"]),
+                "branch": branch,
+                "head": head,
+                "base": base,
+                "onto": target,
+                "need_base_edit": base != target,
+                "upstream_exclude": upstream_exclude,
+                "reason": reason,
+                "action": "rebase",
+                "parent_number": parent_n,
+                "class": r.get("class"),
+                "head_repo": head_repo,
+                "detail": "",
+            }
+        )
+    return plans
+
+
+def _run_git(
+    git: str,
+    args: list[str],
+    *,
+    cwd: str | None = None,
+    timeout: int = 300,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [git, *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def stack_rebase_prs(
+    gh: str,
+    repo: str,
+    rows: list[dict[str, Any]],
+    pr_numbers: set[int],
+    *,
+    dry_run: bool,
+    onto: str = "master",
+    repo_dir: str | None = None,
+    git: str = "git",
+    remote: str = "origin",
+    upstream_override: str | None = None,
+    progress: Any = None,
+) -> list[dict[str, Any]]:
+    """Rebase selected stack children; dry-run prints the plan only."""
+    out = progress if progress is not None else sys.stdout
+    plans = plan_stack_rebase(
+        rows,
+        pr_numbers,
+        onto=onto,
+        listing_repo=repo,
+        upstream_override=upstream_override,
+    )
+    results: list[dict[str, Any]] = []
+    if dry_run:
+        for plan in plans:
+            n = plan["number"]
+            if plan["action"] == "refuse":
+                print(
+                    f"would refuse #{n}: {plan.get('detail') or plan.get('reason')}",
+                    file=out,
+                )
+                results.append({**plan, "status": "would-refuse"})
+                continue
+            base_note = (
+                f"base {plan['base']}→{plan['onto']}"
+                if plan["need_base_edit"]
+                else f"base={plan['base']}"
+            )
+            excl = plan.get("upstream_exclude")
+            excl_note = f"; exclude {excl}" if excl else ""
+            print(
+                f"would rebase #{n} {plan['branch']} onto {plan['onto']} "
+                f"({base_note}; {plan['reason']}{excl_note})",
+                file=out,
+            )
+            results.append({**plan, "status": "would-rebase"})
+        return results
+
+    if not repo_dir:
+        raise RuntimeError("stack-rebase --yes requires --repo-dir PATH")
+    repo_path = os.path.abspath(repo_dir)
+    if not os.path.isdir(repo_path):
+        raise RuntimeError(f"--repo-dir {repo_path} is not a directory")
+    if not os.path.isdir(os.path.join(repo_path, ".git")) and not os.path.isfile(
+        os.path.join(repo_path, ".git")
+    ):
+        raise RuntimeError(f"--repo-dir {repo_path} is not a git checkout")
+
+    fetch = _run_git(git, ["fetch", "--prune", remote], cwd=repo_path)
+    if fetch.returncode != 0:
+        raise RuntimeError(
+            f"git fetch failed: {(fetch.stderr or fetch.stdout).strip()}"
+        )
+
+    for plan in plans:
+        n = int(plan["number"])
+        row = {**plan, "status": "pending"}
+        if plan["action"] == "refuse":
+            print(f"refused #{n}: {plan.get('detail') or plan.get('reason')}", file=out)
+            row["status"] = "refused"
+            results.append(row)
+            continue
+        branch = plan["branch"]
+        target = plan["onto"]
+        wt = tempfile.mkdtemp(prefix=f"ade-stack-rebase-{n}-")
+        try:
+            add = _run_git(
+                git,
+                ["worktree", "add", "--force", wt, f"{remote}/{branch}"],
+                cwd=repo_path,
+            )
+            if add.returncode != 0:
+                # Fallback: local branch name if remote-tracking missing.
+                add = _run_git(
+                    git,
+                    ["worktree", "add", "--force", wt, branch],
+                    cwd=repo_path,
+                )
+            if add.returncode != 0:
+                raise RuntimeError(
+                    f"#{n} worktree add failed: {(add.stderr or add.stdout).strip()}"
+                )
+            onto_ref = f"{remote}/{target}"
+            excl = plan.get("upstream_exclude")
+            if excl:
+                # Squash-merged parent: replay only commits after the old parent tip.
+                excl_ref = excl if SHA40.fullmatch(excl) else f"{remote}/{excl}"
+                # Confirm the exclusion tip resolves before rewriting.
+                rev = _run_git(git, ["rev-parse", "--verify", excl_ref], cwd=wt)
+                if rev.returncode != 0:
+                    detail = (rev.stderr or rev.stdout).strip()
+                    print(
+                        f"refused #{n}: upstream exclude {excl_ref} missing "
+                        f"({detail[:200]}); tip left alone",
+                        file=out,
+                    )
+                    row["status"] = "refused"
+                    row["detail"] = detail[:500]
+                    results.append(row)
+                    continue
+                rb = _run_git(
+                    git, ["rebase", "--onto", onto_ref, excl_ref], cwd=wt
+                )
+            else:
+                rb = _run_git(git, ["rebase", onto_ref], cwd=wt)
+            if rb.returncode != 0:
+                _run_git(git, ["rebase", "--abort"], cwd=wt)
+                detail = (rb.stderr or rb.stdout).strip()
+                print(
+                    f"refused #{n}: rebase conflict onto {onto_ref}; tip left alone "
+                    f"({detail[:200]})",
+                    file=out,
+                )
+                row["status"] = "conflict"
+                row["detail"] = detail[:500]
+                results.append(row)
+                continue
+            push = _run_git(
+                git,
+                ["push", "--force-with-lease", remote, f"HEAD:{branch}"],
+                cwd=wt,
+            )
+            if push.returncode != 0:
+                raise RuntimeError(
+                    f"#{n} push --force-with-lease failed: "
+                    f"{(push.stderr or push.stdout).strip()}"
+                )
+            if plan["need_base_edit"]:
+                edit = run_gh(
+                    gh,
+                    ["pr", "edit", str(n), "--repo", repo, "--base", target],
+                    timeout=120,
+                )
+                if edit.returncode != 0:
+                    raise RuntimeError(
+                        f"#{n} gh pr edit --base {target} failed: "
+                        f"{(edit.stderr or edit.stdout).strip()}"
+                    )
+            print(
+                f"rebased #{n} {branch} onto {target}"
+                + (" (base retargeted)" if plan["need_base_edit"] else ""),
+                file=out,
+            )
+            row["status"] = "rebased"
+            results.append(row)
+        finally:
+            _run_git(git, ["worktree", "remove", "--force", wt], cwd=repo_path)
+            if os.path.isdir(wt):
+                shutil.rmtree(wt, ignore_errors=True)
+    return results
+
+
+def merge_now_prs(
+    gh: str,
+    repo: str,
+    rows: list[dict[str, Any]],
+    pr_numbers: set[int],
+    *,
+    dry_run: bool,
+) -> list[int]:
+    """Squash-merge only tips classified merge_now; refuse otherwise (no gate bypass)."""
+    by_n = {int(r["number"]): r for r in rows}
+    merged: list[int] = []
+    for n in sorted(pr_numbers):
+        r = by_n.get(n)
+        if r is None:
+            raise RuntimeError(
+                f"#{n} not in open listing for this --repo/--min — refuse merge"
+            )
+        if r.get("class") != "merge_now":
+            raise RuntimeError(
+                f"#{n} class={r.get('class')} adversary_marker={r.get('adversary_marker')} "
+                f"pytest_linux={r.get('pytest_linux')} — refuse merge "
+                "(need class=merge_now: pytest-linux pass + adversary-marker success)"
+            )
+        head = r.get("head") or ""
+        if not SHA40.fullmatch(head):
+            raise RuntimeError(f"#{n} missing 40-hex head — refuse merge")
+        if dry_run:
+            print(f"would merge #{n} --squash --match-head-commit {head}")
+            merged.append(n)
+            continue
+        p = run_gh(
+            gh,
+            [
+                "pr",
+                "merge",
+                str(n),
+                "--repo",
+                repo,
+                "--squash",
+                "--match-head-commit",
+                head,
+            ],
+            timeout=180,
+        )
+        if p.returncode != 0:
+            err = (p.stderr or p.stdout).strip()
+            # Native GitHub stacks refuse GraphQL merge; use merge-async instead.
+            if "asynchronous merge" in err or "merge-async" in err:
+                _merge_async_squash(gh, repo, n, head)
+            else:
+                raise RuntimeError(f"gh pr merge #{n} failed: {err}")
+        print(f"merged #{n} squash head={head}")
+        merged.append(n)
+    return merged
+
+
+def print_stacks(stacks: list[dict[str, Any]]) -> None:
+    print(
+        "# Bottom-up APPROVE order from open PR base→head refs "
+        "(operator only; after a real review of each head)."
+    )
+    print("# Never posts or invents a verdict; templates are for paste after review.")
+    print()
+    for stack in stacks:
+        name = stack["group"]
+        order: list[dict[str, Any]] = stack["order"]
+        label = f"{name} bottoms" if stack.get("bottoms_only") else name
+        print(f"## {label}")
+        if not order:
+            print("  (no open PRs matched)")
+            print()
+            continue
+        for i, r in enumerate(order, 1):
+            parent = r.get("parent_number")
+            parent_s = f"←#{parent}" if parent else f"←{r.get('base') or '?'}"
+            print(
+                f"  {i}. #{r['number']} {r.get('branch') or ''} {parent_s}  "
+                f"class={r.get('class')}  head={r.get('head') or ''}"
+            )
+            print(f"     {(r.get('title') or '')[:72]}")
+            if r.get("marker_template"):
+                print(f"     {r['marker_template']}")
+        print()
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="ade-merge-ready",
+        description=(
+            "Classify open ADE PRs against pytest-linux + adversary-marker + live "
+            "APPROVE, print bottom-up stack order, print paste templates, "
+            "(owner only) post APPROVE comments after review, or re-run "
+            "adversary-marker on selected tips."
+        ),
+    )
+    ap.add_argument(
+        "cmd",
+        nargs="?",
+        default="classify",
+        choices=(
+            "classify",
+            "stacks",
+            "approve-paste",
+            "approve-post",
+            "retrigger-marker",
+            "merge-now",
+            "stack-rebase",
+        ),
+        help=(
+            "classify (default), stacks, approve-paste, approve-post, "
+            "retrigger-marker, merge-now (squash only when "
+            "adversary-marker is success), or stack-rebase"
+        ),
+    )
+    ap.add_argument(
+        "--repo",
+        default=os.environ.get("ADE_MERGE_READY_REPO", "djbclark/djbclark-ade"),
+        help="OWNER/NAME (default djbclark/djbclark-ade)",
+    )
+    ap.add_argument(
+        "--min",
+        type=int,
+        default=327,
+        metavar="N",
+        help="only PRs with number >= N (default 327)",
+    )
+    ap.add_argument("--json", action="store_true", help="print JSON")
+    ap.add_argument(
+        "--gh",
+        default=os.environ.get("ADE_GH", "gh"),
+        help="gh binary (or ADE_GH); tests inject a fake",
+    )
+    ap.add_argument(
+        "--group",
+        action="append",
+        choices=list(STACK_GROUP_NAMES),
+        metavar="NAME",
+        help=(
+            "stacks / approve-*: limit to named stack(s): install, claims, s1, "
+            "wave6 (repeatable; default: all four)"
+        ),
+    )
+    ap.add_argument(
+        "--bottoms-only",
+        action="store_true",
+        help=(
+            "stacks / approve-paste / approve-post / retrigger-marker: only "
+            "stack bottoms within each selected group (approve-* / "
+            "retrigger-marker with --group use named stacks; retrigger-marker "
+            "without --group uses bottoms of the full open set)"
+        ),
+    )
+    ap.add_argument(
+        "--base",
+        default="",
+        metavar="REF",
+        help="approve-paste / approve-post: restrict to PRs whose baseRefName equals REF",
+    )
+    ap.add_argument(
+        "--prs",
+        default="",
+        metavar="N,N,…",
+        help=(
+            "approve-paste / approve-post / retrigger-marker / merge-now / "
+            "stack-rebase: only these PR numbers (comma-separated; required "
+            "for merge-now and stack-rebase)"
+        ),
+    )
+    ap.add_argument(
+        "--onto",
+        default="master",
+        metavar="REF",
+        help="stack-rebase: default base when no open parent (default master)",
+    )
+    ap.add_argument(
+        "--upstream",
+        default="",
+        metavar="REF",
+        help=(
+            "stack-rebase: old parent tip/branch to exclude when replaying "
+            "only child commits after a squash merge (default: the PR's "
+            "pre-retarget baseRefName)"
+        ),
+    )
+    ap.add_argument(
+        "--repo-dir",
+        default=os.environ.get("ADE_MERGE_READY_REPO_DIR", ""),
+        metavar="PATH",
+        help="stack-rebase --yes: local clone for worktree rebase (or ADE_MERGE_READY_REPO_DIR)",
+    )
+    ap.add_argument(
+        "--git",
+        default=os.environ.get("ADE_GIT", "git"),
+        help="git binary for stack-rebase (or ADE_GIT); tests inject a fake",
+    )
+    ap.add_argument(
+        "--class",
+        dest="class_name",
+        default="",
+        metavar="NAME",
+        help=(
+            "retrigger-marker: only tips with this classify class "
+            f"({', '.join(CLASS_NAMES)})"
+        ),
+    )
+    ap.add_argument(
+        "--no-marker-dispatch",
+        action="store_true",
+        help="classify / merge-now: do not re-dispatch a missing adversary-marker check",
+    )
+    ap.add_argument(
+        "--marker-grace",
+        type=_grace_arg,
+        default=os.environ.get("ADE_MERGE_READY_MARKER_GRACE", str(DEFAULT_MARKER_GRACE)),
+        metavar="SECONDS",
+        help=(
+            "classify / merge-now: wait this long after pytest-linux completed "
+            f"before dispatching a missing adversary-marker (default {DEFAULT_MARKER_GRACE})"
+        ),
+    )
+    ap.add_argument(
+        "--state-file",
+        default="",
+        metavar="PATH",
+        help=(
+            "classify / merge-now: record of heads already re-dispatched "
+            "(or ADE_MERGE_READY_STATE; default "
+            "~/.local/state/ade/merge-ready/marker-dispatch.json)"
+        ),
+    )
+    ap.add_argument(
+        "--i-reviewed",
+        action="store_true",
+        help="approve-post: affirm a real review of each selected tip head",
+    )
+    ap.add_argument(
+        "--yes",
+        action="store_true",
+        help=(
+            "approve-post / retrigger-marker / merge-now / stack-rebase: "
+            "actually write (default is dry-run)"
+        ),
+    )
+    ap.add_argument(
+        "--trigger-marker",
+        action="store_true",
+        help="approve-post: after each post, gh workflow run adversary-marker.yml -f pr=N",
+    )
+    ap.add_argument(
+        "--via",
+        default="auto",
+        choices=("auto", "body", "comment"),
+        help=(
+            "approve-post: auto=body for owner-authored tips else comment; "
+            "or force body / comment (default auto)"
+        ),
+    )
+    ap.add_argument(
+        "--expect-head",
+        action="append",
+        default=[],
+        metavar="N=40HEX",
+        help=(
+            "approve-post: reviewed tip SHA for PR N (repeatable; N=sha or N:sha). "
+            "Required with --yes; refuse if live headRefOid differs"
+        ),
+    )
+    a = ap.parse_args(argv)
+    try:
+        rows = collect(a.gh, a.repo, a.min)
+    except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
+        return die(str(e))
+
+    pr_numbers: set[int] | None = None
+    if a.prs.strip():
+        try:
+            pr_numbers = {int(x.strip()) for x in a.prs.split(",") if x.strip()}
+        except ValueError:
+            return die("--prs must be comma-separated integers")
+        if not pr_numbers:
+            return die("--prs is empty")
+
+    # classify heals every eligible open tip. merge-now heals only with --yes and
+    # only the PRs named by --prs (a dry-run or a bare invoke never fires the Action).
+    heal_rows: list[dict[str, Any]] | None = None
+    if not a.no_marker_dispatch:
+        if a.cmd == "classify":
+            heal_rows = rows
+        elif a.cmd == "merge-now" and a.yes and pr_numbers is not None:
+            heal_rows = [r for r in rows if int(r["number"]) in pr_numbers]
+    if heal_rows:
+        heal_missing_markers(
+            a.gh,
+            a.repo,
+            heal_rows,
+            grace=a.marker_grace,
+            state_path=a.state_file or default_state_path(),
+            progress=sys.stderr if (a.json or a.cmd == "merge-now") else sys.stdout,
+        )
+
+    if a.cmd == "stacks":
+        stacks = build_named_stacks(
+            rows,
+            groups=a.group,
+            bottoms_only=a.bottoms_only,
+            listing_repo=a.repo,
+        )
+        if a.json:
+            json.dump(stacks, sys.stdout, indent=2, sort_keys=True)
+            sys.stdout.write("\n")
+        else:
+            print_stacks(stacks)
+        return 0
+
+    if a.cmd == "retrigger-marker":
+        class_name = (a.class_name or "").strip() or None
+        if class_name is not None and class_name not in CLASS_NAMES:
+            return die(
+                f"--class must be one of: {', '.join(CLASS_NAMES)} "
+                f"(got {class_name!r})"
+            )
+        if pr_numbers is None and not a.bottoms_only and not class_name:
+            return die(
+                "retrigger-marker requires --prs N[,N…] and/or "
+                "--bottoms-only and/or --class NAME"
+            )
+        selected = select_retrigger_rows(
+            rows,
+            bottoms_only=a.bottoms_only,
+            groups=a.group,
+            listing_repo=a.repo,
+            pr_numbers=pr_numbers,
+            class_name=class_name,
+        )
+        dry_run = not a.yes
+        out = sys.stderr if a.json else sys.stdout
+        if dry_run:
+            print(
+                f"# dry-run retrigger-marker ({len(selected)} tips); "
+                "pass --yes to fire adversary-marker.yml",
+                file=out,
+            )
+        try:
+            fired = retrigger_marker_prs(
+                a.gh, a.repo, selected, dry_run=dry_run, progress=out
+            )
+        except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
+            return die(str(e))
+        if a.json:
+            json.dump(
+                {
+                    "dry_run": dry_run,
+                    "class": class_name,
+                    "bottoms_only": bool(a.bottoms_only),
+                    "triggered": fired,
+                    "numbers": [r["number"] for r in selected],
+                },
+                sys.stdout,
+                indent=2,
+                sort_keys=True,
+            )
+            sys.stdout.write("\n")
+        return 0
+
+    if a.cmd == "merge-now":
+        if pr_numbers is None:
+            return die("merge-now requires --prs N[,N…]")
+        dry_run = not a.yes
+        try:
+            merged = merge_now_prs(
+                a.gh, a.repo, rows, pr_numbers, dry_run=dry_run
+            )
+        except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
+            return die(str(e))
+        if a.json:
+            json.dump(
+                {"dry_run": dry_run, "merged": merged},
+                sys.stdout,
+                indent=2,
+                sort_keys=True,
+            )
+            sys.stdout.write("\n")
+        return 0
+
+    if a.cmd == "stack-rebase":
+        if pr_numbers is None:
+            return die("stack-rebase requires --prs N[,N…]")
+        dry_run = not a.yes
+        out = sys.stderr if a.json else sys.stdout
+        if dry_run:
+            print(
+                f"# dry-run stack-rebase ({len(pr_numbers)} tips); "
+                "pass --yes --repo-dir PATH to rebase + force-with-lease",
+                file=out,
+            )
+        try:
+            results = stack_rebase_prs(
+                a.gh,
+                a.repo,
+                rows,
+                pr_numbers,
+                dry_run=dry_run,
+                onto=a.onto,
+                repo_dir=(a.repo_dir or None),
+                git=a.git,
+                upstream_override=(a.upstream or None),
+                progress=out,
+            )
+        except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
+            return die(str(e))
+        if a.json:
+            json.dump(
+                {
+                    "dry_run": dry_run,
+                    "onto": a.onto,
+                    "results": results,
+                },
+                sys.stdout,
+                indent=2,
+                sort_keys=True,
+            )
+            sys.stdout.write("\n")
+        if any(r.get("status") == "conflict" for r in results):
+            return 1
+        return 0
+
+    if a.cmd in ("approve-paste", "approve-post"):
+        paste_rows = select_approve_rows(
+            rows,
+            base=a.base,
+            bottoms_only=a.bottoms_only,
+            groups=a.group,
+            listing_repo=a.repo,
+            pr_numbers=pr_numbers,
+        )
+        if a.cmd == "approve-paste":
+            if a.json:
+                json.dump(paste_rows, sys.stdout, indent=2, sort_keys=True)
+                sys.stdout.write("\n")
+            else:
+                print_approve_paste(paste_rows)
+            return 0
+
+        dry_run = not a.yes
+        if a.yes and not a.i_reviewed:
+            return die(
+                "approve-post --yes requires --i-reviewed (affirm real tip review)"
+            )
+        try:
+            expect_heads = parse_expect_heads(a.expect_head)
+            login = gh_login(a.gh)
+            owner = repo_owner_login(a.gh, a.repo)
+        except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
+            return die(str(e))
+        if login != owner:
+            return die(
+                f"approve-post refuses: gh user {login!r} is not repo owner "
+                f"{owner!r} (only the owner's comment counts for APPROVE)"
+            )
+        if not paste_rows:
+            print(
+                "ade-merge-ready: no needs_approve rows matched filters",
+                file=sys.stderr,
+            )
+            return 0
+        if a.yes:
+            try:
+                require_expect_heads(paste_rows, expect_heads)
+            except RuntimeError as e:
+                return die(str(e))
+        out = sys.stderr if a.json else sys.stdout
+        if dry_run:
+            print(
+                f"# dry-run as owner {login} ({len(paste_rows)} tips, via={a.via}); "
+                "pass --i-reviewed --yes --expect-head N=sha… to post",
+                file=out,
+            )
+            for r in paste_rows:
+                print(
+                    f"# pin: --expect-head {r['number']}={r.get('head') or ''}",
+                    file=out,
+                )
+        posted = 0
+        vias: list[str] = []
+        for r in paste_rows:
+            try:
+                via = resolve_approve_via(a.via, bool(r.get("owner_pr")))
+                vias.append(via)
+                if via == "body":
+                    post_approve_body(
+                        a.gh,
+                        a.repo,
+                        int(r["number"]),
+                        r["head"],
+                        dry_run=dry_run,
+                        trigger_marker=a.trigger_marker,
+                        progress=out,
+                    )
+                else:
+                    post_approve_comment(
+                        a.gh,
+                        a.repo,
+                        int(r["number"]),
+                        r["head"],
+                        dry_run=dry_run,
+                        trigger_marker=a.trigger_marker,
+                        progress=out,
+                    )
+            except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
+                return die(str(e))
+            posted += 1
+        if a.json:
+            json.dump(
+                {
+                    "dry_run": dry_run,
+                    "owner": owner,
+                    "via": a.via,
+                    "posted": posted,
+                    "numbers": [r["number"] for r in paste_rows],
+                    "heads": {str(r["number"]): r.get("head") for r in paste_rows},
+                    "vias": vias,
+                },
+                sys.stdout,
+                indent=2,
+                sort_keys=True,
+            )
+            sys.stdout.write("\n")
+        return 0
+
+    if a.json:
+        json.dump(rows, sys.stdout, indent=2, sort_keys=True)
+        sys.stdout.write("\n")
+    else:
+        print_table(rows)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

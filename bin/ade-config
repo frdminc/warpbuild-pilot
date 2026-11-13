@@ -1,0 +1,266 @@
+#!/usr/bin/env -S python3 -I
+"""ade-config: check/get/diff/set for the versioned effective ADE config (schema_version=1).
+
+  ade-config check [--root DIR] [--home DIR] [--json]
+  ade-config get PATH [--root DIR] [--home DIR] [--json]
+  ade-config diff [--root DIR] [--home DIR] [--json]
+  ade-config set PATH VALUE [--target local|repo] [--string] [--dry-run]
+                 [--create-key] [--root DIR] [--home DIR] [--json]
+  ade-config export-unified [--root DIR] [--write | --check]
+
+export-unified prints the config/ade.toml generated from the legacy files (proved equal to their
+effective projection); --write creates it (never overwrites); --check exits 1 on drift, 2 if absent.
+
+check/get/diff stay read-only: no writes, no secret resolution, no network/auth.
+set performs a comment-preserving atomic scalar write (default --target local).
+Missing config/ade.toml projects legacy routing.toml + gates.toml. Present invalid
+or unknown-version config fails. Local override: ~/.config/djbclark-ade/local.toml.
+ROUTING_POLICY / GATES_TOML remain isolated legacy-format overrides and are never
+set targets. Local/repo set records choices; effective readers adopt on their next
+load, and set does not prove runtime reload (adoption=recorded-only). Bounded
+context/key metadata writes are documented in docs/config-migration.md.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+BIN = Path(__file__).resolve().parent
+if str(BIN) not in sys.path:
+    sys.path.insert(0, str(BIN))
+
+import ade_config as ac  # noqa: E402
+import ade_config_edit as ace  # noqa: E402
+import ade_config_export as acx  # noqa: E402
+
+
+def _print_json(obj: object) -> None:
+    json.dump(obj, sys.stdout, indent=2, sort_keys=True, default=str)
+    sys.stdout.write("\n")
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    errors, effective = ac.check(
+        root=Path(args.root) if args.root else None,
+        home=Path(args.home) if args.home else None,
+    )
+    if args.json:
+        _print_json({
+            "ok": not errors,
+            "errors": errors,
+            "provenance": None if effective is None else effective.provenance,
+        })
+    elif errors:
+        for err in errors:
+            print(err, file=sys.stderr)
+        print("ade-config check: FAIL", file=sys.stderr)
+    else:
+        assert effective is not None
+        prov = effective.provenance
+        print("ade-config check: OK")
+        print(f"  schema_version={effective.data.get('schema_version')}")
+        print(f"  routing_source={prov.get('routing_source')}")
+        print(f"  gates_source={prov.get('gates_source')}")
+        print(f"  local_config={prov.get('local_config')}")
+        ginfo = prov.get("gates_info") or {}
+        print(f"  gates_info.source={ginfo.get('source')}")
+        if ginfo.get("toml_error"):
+            print(f"  gates_info.toml_error={ginfo.get('toml_error')}")
+    return 1 if errors else 0
+
+
+def cmd_get(args: argparse.Namespace) -> int:
+    try:
+        effective = ac.load_effective(
+            root=Path(args.root) if args.root else None,
+            home=Path(args.home) if args.home else None,
+        )
+        value = ac.get_path(effective.data, args.path)
+    except ac.ConfigError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    if args.json:
+        _print_json({"path": args.path, "value": value})
+    else:
+        if isinstance(value, (dict, list)):
+            _print_json(value)
+        else:
+            print(value)
+    return 0
+
+
+def cmd_diff(args: argparse.Namespace) -> int:
+    try:
+        changes = ac.local_diff(
+            root=Path(args.root) if args.root else None,
+            home=Path(args.home) if args.home else None,
+        )
+    except ac.ConfigError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    payload = [{"path": c.path, "before": c.before, "after": c.after} for c in changes]
+    if args.json:
+        _print_json({"changes": payload})
+    elif not payload:
+        print("ade-config diff: no local override delta")
+    else:
+        print(f"ade-config diff: {len(payload)} change(s)")
+        for item in payload:
+            print(f"  {item['path']}: {item['before']!r} -> {item['after']!r}")
+    return 0
+
+
+def cmd_set(args: argparse.Namespace) -> int:
+    try:
+        value = ace.parse_cli_value(args.value, as_string=args.string)
+        result = ace.set_scalar(
+            args.path,
+            value,
+            target=args.target,
+            root=Path(args.root) if args.root else None,
+            home=Path(args.home) if args.home else None,
+            dry_run=args.dry_run,
+            create_key=args.create_key,
+        )
+    except ac.ConfigError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    payload = {
+        "path": args.path,
+        "before": result.before,
+        "after": result.after,
+        "changed": result.changed,
+        "dry_run": result.dry_run,
+        "target": result.target.target,
+        "kind": result.target.kind,
+        "file": str(result.target.path),
+        "file_path": ".".join(result.target.file_parts),
+        "adoption": result.adoption,
+        "adoption_note": result.adoption_note,
+    }
+    if args.json:
+        _print_json(payload)
+    else:
+        action = "would set" if result.dry_run else ("set" if result.changed else "unchanged")
+        print(
+            f"ade-config set: {action} {args.path} = {result.after!r} "
+            f"(target={result.target.target}, kind={result.target.kind})"
+        )
+        print(f"  file={result.target.path}")
+        print(f"  before={result.before!r}")
+        print(f"  adoption={result.adoption}")
+        print(f"  note={result.adoption_note}")
+    return 0
+
+
+def cmd_export_unified(args: argparse.Namespace) -> int:
+    root = Path(args.root) if args.root else ac.repo_root_from_here()
+    try:
+        if args.check:
+            code, message = acx.check_unified(root)
+            print(f"ade-config export-unified: {message}", file=sys.stderr if code else sys.stdout)
+            return code
+        if args.write:
+            print(f"ade-config export-unified: wrote {acx.write_unified(root)}")
+            return 0
+        sys.stdout.write(acx.generate_unified(root))
+        return 0
+    except (ac.ConfigError, OSError) as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    shared = argparse.ArgumentParser(add_help=False)
+    # A subparser parses into its own namespace. Implicit defaults must not
+    # overwrite explicit targets already parsed before the subcommand.
+    shared.add_argument("--root", default=argparse.SUPPRESS,
+                        help="repository root; before/after command, last explicit wins")
+    shared.add_argument(
+        "--home", default=argparse.SUPPRESS,
+        help="HOME for local.toml; before/after command, last explicit wins (default: real home)",
+    )
+    parser = argparse.ArgumentParser(
+        prog="ade-config",
+        description="check/get/diff/set for versioned effective ADE config.",
+        parents=[shared],
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_check = sub.add_parser(
+        "check",
+        parents=[shared],
+        help="validate effective config (no writes)",
+    )
+    p_check.add_argument("--json", action="store_true")
+    p_check.set_defaults(func=cmd_check)
+
+    p_get = sub.add_parser(
+        "get",
+        parents=[shared],
+        help="print one effective path",
+    )
+    p_get.add_argument("path", help="dotted path, e.g. lead.fable_lead")
+    p_get.add_argument("--json", action="store_true")
+    p_get.set_defaults(func=cmd_get)
+
+    p_diff = sub.add_parser(
+        "diff",
+        parents=[shared],
+        help="show local.toml delta vs without local",
+    )
+    p_diff.add_argument("--json", action="store_true")
+    p_diff.set_defaults(func=cmd_diff)
+
+    p_set = sub.add_parser(
+        "set",
+        parents=[shared],
+        help="atomically set one scalar (default --target local; preserves comments)",
+    )
+    p_set.add_argument("path", help="dotted path, e.g. lead.fable_lead")
+    p_set.add_argument("value", help="TOML scalar or string array (documented array fields), or any text with --string")
+    p_set.add_argument(
+        "--target",
+        choices=("local", "repo"),
+        default="local",
+        help="local (default): ~/.config/djbclark-ade/local.toml; "
+             "repo: config/ade.toml if present, else the legacy file for that domain",
+    )
+    p_set.add_argument(
+        "--string",
+        action="store_true",
+        help="treat VALUE as a string even when it looks like a TOML literal",
+    )
+    p_set.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show the planned write without touching the file",
+    )
+    p_set.add_argument(
+        "--create-key",
+        action="store_true",
+        help="allow keys.NAME.FIELD to add a new registry identity (NAME is a secret reference name)",
+    )
+    p_set.add_argument("--json", action="store_true")
+    p_set.set_defaults(func=cmd_set)
+
+    p_export = sub.add_parser(
+        "export-unified",
+        parents=[shared],
+        help="generate config/ade.toml from the legacy files (stdout; --write creates it, --check reports drift)",
+    )
+    mode = p_export.add_mutually_exclusive_group()
+    mode.add_argument("--write", action="store_true", help="create config/ade.toml (refuses to overwrite)")
+    mode.add_argument("--check", action="store_true", help="exit 1 when ade.toml differs from a regenerated copy")
+    p_export.set_defaults(func=cmd_export_unified)
+
+    args = parser.parse_args(argv)
+    args.root = getattr(args, "root", None)
+    args.home = getattr(args, "home", None)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

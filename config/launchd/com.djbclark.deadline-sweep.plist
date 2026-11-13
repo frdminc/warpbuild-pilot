@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template: `deadline install` replaces __ADE__ (the djbclark-ade checkout), __HOME__ and __STATE__ (the state dir).
+     RELAY_SENDER_NAME declares this job's identity: the relay shim (2026-11-06) names it in a `[relay from NAME]` prefix, a launchd job having no Paseo id. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.djbclark.deadline-sweep</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__ADE__/bin/ade-job-run</string><string>--lock-dir</string><string>__ADMISSION__</string><string>com.djbclark.deadline-sweep</string><string>--</string>
+    <string>__ADE__/bin/deadline</string>
+    <string>sweep</string>
+  </array>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>RELAY_SENDER_NAME</key><string>deadline-sweep</string>
+    <key>DEADLINE_STATE_DIR</key><string>__STATE__</string>
+  </dict>
+  <key>StandardOutPath</key><string>__STATE__/sweep.log</string>
+  <key>StandardErrorPath</key><string>__STATE__/sweep.log</string>
+</dict>
+</plist>

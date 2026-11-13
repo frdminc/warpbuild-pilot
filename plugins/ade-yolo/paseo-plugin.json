@@ -1,0 +1,9 @@
+{
+  "id": "ade-yolo",
+  "name": "ADE ordinary-agent YOLO",
+  "description": "Requires native catalog-backed unattended configuration on ordinary creates and checks saved configuration on resume; preserves explicit restrictive and external-security-critical scope.",
+  "version": "0.2.0",
+  "requirements": {
+    "paseo": ">=0.14.0"
+  }
+}

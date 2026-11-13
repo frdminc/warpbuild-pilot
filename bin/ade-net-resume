@@ -1,0 +1,703 @@
+#!/usr/bin/env python3
+"""Resume a lead's descendants after recognized transient network failures, dry-run by default.
+
+With --quota a second pass also resumes Pi agents stopped by a provider quota window once aiuse
+shows that window reset. See docs/net-resume.md. Exit 0: scan completed; 2: usage/state/CLI
+failure; 3: another scanner holds the lock. No schedules are installed by this command.
+"""
+from __future__ import annotations
+
+import argparse
+from datetime import datetime
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+import uuid
+
+CLI_TIMEOUT = 15
+RESERVE_MARGIN = 1
+
+PROMPT = "network outage over; continue from where you stopped, re-fetch first, same report path"
+# Claude's transient Cloudflare 403 page (real stop, 2026-11-13 ~10:15Z, several agents; the next prompt resumed each).
+# Exact wording only: a generic 403 or "Failed to authenticate" is a real logout and must never be resumed.
+CLAUDE_CLOUDFLARE_403 = (r"\[System Error\] Failed to authenticate\. API Error: 403 "
+                         r"Attention Required! \| Cloudflare")
+# Claude Code prints this unrelated warning after the stop line; it alone may trail the error line.
+CLAUDE_TRAILER = re.compile(r"Warning: claude\.ai MCP servers blocked by enterprise policy:.*")
+# Deliberately narrow: only the final rendered line, never a matching historical prompt.
+NETWORK = {
+    "antigravity": (r"\[System Error\] There was a network issue connecting to the server, please try again\.",),
+    "codex": (r"\[System Error\] (?:stream disconnected before completion|error sending request for url)",),
+    "claude": (r"\[System Error\] (?:Connection error\.|Request timed out\.)", CLAUDE_CLOUDFLARE_403),
+    "pi": (r"\[System Error\] (?:fetch failed|ECONNRESET|ETIMEDOUT)",),
+}
+HOSTS = {
+    "antigravity": "https://daily-cloudcode-pa.googleapis.com/",
+    "codex": "https://chatgpt.com/",
+    "claude": "https://api.anthropic.com/",
+    # Pi can route many services; a host cannot be inferred safely from 'pi'.
+}
+QUOTA_PROMPT = ("provider quota window reset; continue from where you stopped, check any interrupted "
+                "operation before retrying, same report path")
+# --quota only. The rendered last line of a real z.ai 5-hour stop (2026-11-12, agent f2802e7c); the
+# 5-hour wording keeps weekly stops out. Add a pool only together with a line copied from a real stop.
+QUOTA = {
+    "zai": r'\[System Error\] 429: \{"code":"1308","message":"Usage limit reached for 5 hour\. '
+           r'Your limit will reset at \d{4}-\d\d-\d\d \d\d:\d\d:\d\d"\} '
+           r'\(stopReason=error, model=zai/[\w.-]+\)',
+}
+POOL_MODEL_PREFIX = {"zai": "zai/"}  # Pi pools only: claude and codex belong to session-guard.
+QUOTA_DENIED = re.compile(r"auth|credential|api.?key|billing|credit|balance|\b1113\b|\b40[13]\b", re.I)
+QUOTA_MAX_WINDOW_MINUTES = 360  # 5-hour and session windows; a weekly wait exceeds any staleness bound.
+QUOTA_EXHAUSTED_PERCENT = 95
+QUOTA_POOL_GAP_SECONDS = 600  # At least this long between two quota resumes of one pool, across scans and runs.
+FIRST_SIGHT_BLOCKED = frozenset({"delivered", "changed"})  # First-sight outcomes that never arm a wait.
+GUARD_TERMINAL = frozenset({"resumed", "cancelled"})
+AIUSE_TIMEOUT = 30
+DENIED = re.compile(r"1302|1308|\b429\b|\b40[13]\b|quota|rate.?limit|auth|credential|api.?key|refus|policy|billing|credit|usage.?limit|capacity", re.I)
+
+
+class ScanError(Exception):
+    pass
+
+
+def number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def stamp(value):
+    """Epoch seconds of a timezone-aware ISO timestamp; ValueError otherwise."""
+    if not isinstance(value, str):
+        raise ValueError("timestamp is not a string")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("timestamp has no timezone")
+    return parsed.timestamp()
+
+
+def pool_of(record):
+    if record.get("Provider") != "pi":
+        return None
+    model = record.get("Model")
+    if not isinstance(model, str):
+        return None
+    for pool, prefix in POOL_MODEL_PREFIX.items():
+        if model.startswith(prefix):
+            return pool
+    return None
+
+
+def quota_line(pool, logs):
+    lines = logs.strip().splitlines()
+    last = lines[-1].strip() if lines else ""
+    pattern = QUOTA.get(pool)
+    return bool(last and pattern and not QUOTA_DENIED.search(last) and re.fullmatch(pattern, last))
+
+
+def done_line(text):
+    """Only an unquoted, unfenced delivery line counts."""
+    fence = None
+    for line in text.splitlines():
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if marker:
+            run = marker.group(1)
+            if fence is None:
+                fence = run
+            elif run[0] == fence[0] and len(run) >= len(fence) and not line[marker.end():].strip():
+                fence = None
+            continue
+        if fence is None and re.match(r"^done:[ \t]+\S", line):
+            return True
+    return False
+
+
+def agent_id(value):
+    try:
+        return str(uuid.UUID(value))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ScanError("expected full agent UUID") from exc
+
+
+def final_lines(provider, logs):
+    """The rendered lines that decide a stop; Claude's trailing MCP-policy warning (and blanks) is not part of it."""
+    lines = logs.strip().splitlines()
+    if provider == "claude":
+        while lines and (not lines[-1].strip() or CLAUDE_TRAILER.fullmatch(lines[-1].strip())):
+            lines.pop()
+    return lines
+
+
+def transient(provider, logs):
+    lines = final_lines(provider, logs)
+    last = lines[-1].strip() if lines else ""
+    # The one DENIED exemption: the exact Cloudflare 403 line (it matches "403" and "auth" by wording alone).
+    cloudflare = provider == "claude" and re.fullmatch(CLAUDE_CLOUDFLARE_403, last)
+    return bool(last and (cloudflare or not DENIED.search(last)) and any(
+        re.fullmatch(pattern, last) for pattern in NETWORK.get(provider, ())
+    ))
+
+
+class Scanner:
+    def __init__(self, lead, state, apply=False, duration=120, max_error_age_minutes=30, quota=False,
+                 only_agents=(), quota_per_pool=1, quota_grace_seconds=60, guard_state=None):
+        self.lead = agent_id(lead)
+        self.state = state
+        self.apply = apply
+        self.max_error_age = max_error_age_minutes * 60
+        self.deadline = time.monotonic() + duration
+        self.quota = quota
+        self.only = frozenset(agent_id(a) for a in only_agents)
+        self.quota_per_pool = quota_per_pool
+        self.quota_grace = quota_grace_seconds
+        self.guard_state = guard_state or Path.home() / ".paseo/plugin-data/session-guard/state.json"
+        self._aiuse = None
+
+    def remaining(self):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise ScanError("scan deadline reached")
+        return remaining
+
+    def cli(self, *args, accepted=False):
+        try:
+            result = subprocess.run(["paseo", *args], capture_output=True, text=True,
+                                    timeout=min(CLI_TIMEOUT, self.remaining()))
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ScanError("Paseo unavailable or timed out") from exc
+        if result.returncode not in ((0, 5) if accepted else (0,)):
+            raise ScanError("Paseo command failed")
+        return result.stdout
+
+    def inspect(self, aid):
+        data = json.loads(self.cli("agent", "inspect", agent_id(aid), "--json"))
+        if not isinstance(data, dict) or data.get("Id") != aid:
+            raise ScanError("invalid inspect response")
+        return data
+
+    def descendant(self, aid):
+        seen = {self.lead}
+        while aid and aid not in seen:
+            seen.add(aid)
+            record = self.inspect(aid)
+            # Missing ancestry is unknown, not a root.
+            if "ParentAgentId" not in record:
+                return False
+            parent = record.get("ParentAgentId")
+            if parent == self.lead:
+                return True
+            aid = parent
+        return False
+
+    def healthy(self, url):
+        # A subprocess deadline also bounds DNS lookup, unlike a socket timeout.
+        budget = min(5, self.remaining())
+        try:
+            result = subprocess.run(
+                ["curl", "-q", "--silent", "--head", "--output", os.devnull,
+                 "--write-out", "%{http_code}", "--proto", "=https",
+                 "--max-time", str(budget), url],
+                capture_output=True, text=True, timeout=budget)
+            code = int(result.stdout.strip())
+            return result.returncode == 0 and 200 <= code < 500 and code != 429
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return False
+
+    def recent_error(self, record):
+        updated = record.get("UpdatedAt")
+        if not isinstance(updated, str):
+            return False
+        try:
+            stamp = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                return False
+            age = time.time() - stamp.timestamp()
+        except (ValueError, OverflowError, OSError):
+            return False
+        return math.isfinite(age) and 0 <= age <= self.max_error_age
+
+    def delivered(self, aid, provider):
+        activity = json.loads(self.cli("logs", aid, "--json"))
+        if (not isinstance(activity, dict) or activity.get("agentId") != aid
+                or not isinstance(activity.get("items"), list)):
+            raise ScanError("invalid structured logs")
+        for item in reversed(activity["items"]):
+            if not isinstance(item, dict):
+                raise ScanError("invalid timeline item")
+            if item.get("type") == "user_message":
+                return False  # A new task invalidates earlier delivery text.
+            if item.get("type") != "assistant_message":
+                continue
+            text = item.get("text")
+            if not isinstance(text, str):
+                raise ScanError("invalid assistant output")
+            if len(final_lines(provider, text)) == 1 and transient(provider, text):
+                continue  # The terminal system error is rendered as assistant text.
+            # Only an unquoted, unfenced delivery line in the latest output counts.
+            return done_line(text)
+        return False
+
+    def signature(self, record, logs, provider=None):
+        # UpdatedAt identifies the error event; timeline rendering can vary.
+        updated = record.get("UpdatedAt")
+        if not isinstance(updated, str) or not updated:
+            raise ScanError("missing error event timestamp")
+        lines = final_lines(provider, logs)
+        if not lines:
+            raise ScanError("error logs disappeared")
+        line = lines[-1].strip()
+        return hashlib.sha256(json.dumps([updated, line]).encode()).hexdigest()
+
+    def event(self, file, aid, action, **fields):
+        row = {"time": time.time(), "lead": self.lead, "agent": aid,
+               "action": action, **fields}
+        file.write(json.dumps(row, sort_keys=True) + "\n")
+        file.flush()
+        os.fsync(file.fileno())
+        print(json.dumps(row, sort_keys=True), flush=True)
+
+    # --- quota pass (--quota): Pi pools only, aiuse is the reset anchor, fail closed ---
+
+    def note(self, history, events, aid, action, key=None, **fields):
+        """Write an event; with a key, once per (agent, action, key) so waiting never spams the ledger."""
+        if key is not None:
+            if any(e.get("agent") == aid and e.get("action") == action and e.get("key") == key for e in events):
+                return
+            fields["key"] = key
+        self.event(history, aid, action, **fields)
+        events.append({"agent": aid, "action": action, "time": time.time(), **fields})
+
+    def guard_pending(self, aid):
+        try:
+            text = self.guard_state.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise ScanError("session-guard state unreadable") from exc
+        pauses = json.loads(text).get("pauses")
+        if not isinstance(pauses, list):
+            raise ScanError("invalid session-guard state")
+        return any(isinstance(p, dict) and p.get("agentId") == aid and p.get("phase") not in GUARD_TERMINAL
+                   for p in pauses)
+
+    def aiuse_account(self, pool):
+        """The pool's aiuse account, or None when aiuse is missing, unparseable or ambiguous."""
+        if self._aiuse is None:
+            accounts = False
+            try:
+                result = subprocess.run(["aiuse", "--json"], capture_output=True, text=True,
+                                        timeout=min(AIUSE_TIMEOUT, self.remaining()))
+                snapshot = json.loads(result.stdout).get("snapshot") if result.returncode == 0 else None
+                found = snapshot.get("accounts") if isinstance(snapshot, dict) else None
+                accounts = found if isinstance(found, list) else False
+            except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError):
+                pass
+            self._aiuse = accounts
+        if self._aiuse is False:
+            return None
+        matches = [a for a in self._aiuse if isinstance(a, dict) and a.get("provider") == pool]
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def windows(account):
+        found = account.get("windows")
+        return [w for w in found if isinstance(w, dict)] if isinstance(found, list) else []
+
+    @staticmethod
+    def exhausted(window):
+        used = window.get("used_percent")
+        return window.get("state") == "exhausted" or (number(used) and used >= QUOTA_EXHAUSTED_PERCENT)
+
+    def quota_anchor(self, account, error_time):
+        """('wait', fields) | ('unconfirmed'|'excluded'|'stale', None) from the exhausted window of an aiuse account."""
+        spent = [w for w in self.windows(account) if self.exhausted(w)]
+        if not spent:
+            return "unconfirmed", None
+        if any(not number(w.get("window_minutes")) or w["window_minutes"] > QUOTA_MAX_WINDOW_MINUTES for w in spent):
+            return "excluded", None  # A weekly stop binds this pool: no resume.
+        valid = []
+        for w in spent:
+            try:
+                reset = stamp(w.get("resets_at"))
+            except ValueError:
+                continue
+            if error_time < reset <= error_time + w["window_minutes"] * 60 and isinstance(w.get("window_id"), str):
+                valid.append((reset, w))
+        if not valid:
+            return "stale", None
+        reset, w = max(valid, key=lambda pair: pair[0])
+        return "wait", {"window_id": w["window_id"], "window_minutes": w["window_minutes"],
+                        "resets_at": w["resets_at"]}
+
+    def reset_confirmed(self, account, wait):
+        """A fresh, usable aiuse sample taken after reset plus grace shows the recorded window below the limit."""
+        if (not isinstance(account, dict) or account.get("fresh") is not True or account.get("stale") is True
+                or account.get("usable_now") is not True):
+            return False
+        try:
+            collected = stamp(account.get("collected_at"))
+            reset = stamp(wait["resets_at"])
+        except ValueError:
+            return False
+        if not reset + self.quota_grace <= collected <= time.time():
+            return False
+        if any(self.exhausted(w) and not (number(w.get("window_minutes"))
+                                          and w["window_minutes"] <= QUOTA_MAX_WINDOW_MINUTES)
+               for w in self.windows(account)):
+            return False  # A weekly (or unknown-length) window binds the pool, whatever usable_now says.
+        window = [w for w in self.windows(account) if w.get("window_id") == wait["window_id"]]
+        return (len(window) == 1 and not self.exhausted(window[0])
+                and number(window[0].get("used_percent")))
+
+    def quota_activity(self, aid, pool):
+        """'ok' | 'user' | 'changed' | 'delivered' for the timeline after the recorded quota stop."""
+        activity = json.loads(self.cli("logs", aid, "--json"))
+        if (not isinstance(activity, dict) or activity.get("agentId") != aid
+                or not isinstance(activity.get("items"), list)):
+            raise ScanError("invalid structured logs")
+        found = False
+        for item in reversed(activity["items"]):
+            if not isinstance(item, dict):
+                raise ScanError("invalid timeline item")
+            kind = item.get("type")
+            if kind == "user_message":
+                return "ok" if found else "user"  # Before the error: an older task. After: a new instruction.
+            if kind != "assistant_message":
+                continue
+            text = item.get("text")
+            if not isinstance(text, str):
+                raise ScanError("invalid assistant output")
+            if not found:
+                if len(text.strip().splitlines()) == 1 and quota_line(pool, text):
+                    found = True
+                    continue
+                return "changed"  # The agent produced other output after the stop.
+            return "delivered" if done_line(text) else "ok"
+        return "ok" if found else "changed"
+
+    def quota_waits(self, history, events):
+        """Latest valid `quota-wait` per agent. A malformed row is skipped with one keyed warning, never fatal."""
+        waits = {}
+        for e in list(events):  # note() appends to `events` below.
+            if e.get("action") != "quota-wait":
+                continue
+            try:
+                if not (isinstance(e.get("agent"), str) and all(isinstance(e.get(k), str) for k in
+                        ("signature", "pool", "window_id", "resets_at", "updated_at"))
+                        and number(e.get("window_minutes"))):
+                    raise ValueError("bad field")
+                stamp(e["resets_at"])
+                stamp(e["updated_at"])
+            except ValueError:
+                agent = e.get("agent") if isinstance(e.get("agent"), str) else None
+                self.note(history, events, agent, "quota-ledger-invalid", key=f"{e['time']}:{e.get('signature')}")
+                continue
+            if e["agent"] not in waits or e["time"] >= waits[e["agent"]]["time"]:
+                waits[e["agent"]] = e
+        return waits
+
+    @staticmethod
+    def quota_first_rows(events):
+        """Latest first-sight outcome per agent: (agent, error event) pairs already read once."""
+        rows = {}
+        for e in events:
+            if e.get("stage") == "first-sight" and all(isinstance(e.get(k), str) for k in
+                                                       ("agent", "signature", "updated_at", "pool", "action")):
+                if e["agent"] not in rows or e["time"] >= rows[e["agent"]]["time"]:
+                    rows[e["agent"]] = e
+        return rows
+
+    def quota_scan(self, agents, history, events):
+        self._aiuse = None
+        waits = self.quota_waits(history, events)
+        firsts = self.quota_first_rows(events)
+        sent = {(e.get("agent"), e.get("signature")) for e in events if e.get("action") == "reserved"}
+        resumed = {}
+        for row in agents:
+            aid = None
+            try:
+                if not isinstance(row, dict) or row.get("status") not in ("error", "closed"):
+                    continue
+                aid = agent_id(row.get("id"))
+                if self.only and aid not in self.only:
+                    continue
+                wait = waits.get(aid)
+                if row.get("status") == "closed" and (
+                        wait is None or (aid, wait["signature"]) in sent
+                        or time.time() - stamp(wait["resets_at"]) > self.max_error_age):
+                    continue  # Only an agent we saw fail, not yet resumed and not stale, can be a closed candidate.
+                record = self.inspect(aid)
+                pool = pool_of(record)
+                if record.get("Archived") is not False or pool is None or not self.descendant(aid):
+                    continue
+                if self.guard_pending(aid):
+                    self.note(history, events, aid, "guard-owned", key=str(record.get("UpdatedAt")))
+                    continue
+                updated = record.get("UpdatedAt")
+                status = record.get("Status")
+                if status == "error":
+                    # `paseo logs` reloads an agent that is not live, and inspect keeps reporting the stored
+                    # `error` after a daemon restart: bound the age before any logs call (like recent_error).
+                    age = time.time() - stamp(updated)
+                    if not 0 <= age <= QUOTA_MAX_WINDOW_MINUTES * 60 + self.max_error_age:
+                        continue
+                    first = firsts.get(aid)
+                    known = first if (first is not None and first["pool"] == pool
+                                      and first["updated_at"] == updated) else None
+                    if wait is not None and wait["pool"] == pool and wait["updated_at"] == updated:
+                        signature = wait["signature"]  # The ledger already identifies this error event.
+                    elif known is not None:
+                        # Read once already (UpdatedAt is the event identity: any new activity changes it).
+                        if known["action"] in FIRST_SIGHT_BLOCKED:
+                            continue
+                        signature = known["signature"]
+                    else:
+                        logs = self.cli("logs", aid)
+                        if not quota_line(pool, logs):
+                            continue
+                        signature = self.signature(record, logs)
+                elif status == "closed" and wait is not None:
+                    if updated != wait["updated_at"]:
+                        self.note(history, events, aid, "changed", key=str(updated))
+                        continue
+                    signature = wait["signature"]
+                else:
+                    continue
+                if wait is None or wait["signature"] != signature or wait["pool"] != pool:
+                    if status == "error":
+                        self.quota_first_sight(history, events, waits, aid, pool, updated, signature,
+                                               checked=known is not None)
+                    continue
+                if (aid, signature) in sent:
+                    self.note(history, events, aid, "capped", key=signature)
+                    continue
+                reset = stamp(wait["resets_at"])
+                now = time.time()
+                if now - reset > self.max_error_age:
+                    self.note(history, events, aid, "stale", key=signature)
+                    continue
+                if now < reset + self.quota_grace or resumed.get(pool, 0) >= self.quota_per_pool:
+                    continue
+                if any(e.get("action") == "reserved" and e.get("kind") == "quota" and e.get("pool") == pool
+                       and number(e.get("time")) and e["time"] > now - QUOTA_POOL_GAP_SECONDS for e in events):
+                    self.note(history, events, aid, "pool-gap", key=f"{signature}:{int(now // 600)}", pool=pool)
+                    continue
+                account = self.aiuse_account(pool)
+                if not self.reset_confirmed(account, wait):
+                    self.note(history, events, aid, "quota-waiting", key=f"{signature}:{int(now // 600)}", pool=pool)
+                    continue
+                if status == "error":
+                    state = self.quota_activity(aid, pool)
+                    if state != "ok":
+                        self.note(history, events, aid, "delivered" if state == "delivered" else "changed",
+                                  key=signature)
+                        continue
+                attempts = [e for e in events if e.get("agent") == aid and e.get("action") == "reserved"]
+                if sum(e["time"] > now - 3600 for e in attempts) >= 2:
+                    self.note(history, events, aid, "capped", key=signature)
+                    continue
+                if not self.apply:
+                    self.note(history, events, aid, "would-resume-quota", key=signature, pool=pool)
+                    resumed[pool] = resumed.get(pool, 0) + 1
+                    continue
+                # Re-read mutable state and ancestry before sending.
+                fresh = self.inspect(aid)
+                fresh_logs = self.cli("logs", aid) if status == "error" else None
+                same = (fresh.get("Status") == status and fresh.get("Archived") is False
+                        and fresh.get("Provider") == record.get("Provider") and pool_of(fresh) == pool
+                        and fresh.get("UpdatedAt") == updated and self.descendant(aid)
+                        and not self.guard_pending(aid))
+                if same and status == "error":
+                    same = (quota_line(pool, fresh_logs) and self.signature(fresh, fresh_logs) == signature
+                            and self.quota_activity(aid, pool) == "ok")
+                if not same:
+                    self.note(history, events, aid, "changed", key=f"presend:{signature}")
+                    continue
+                if self.remaining() < CLI_TIMEOUT + RESERVE_MARGIN:
+                    self.event(history, aid, "deadline-before-reserve")
+                    return
+                self.event(history, aid, "reserved", signature=signature, pool=pool, kind="quota")
+                events.append({"agent": aid, "action": "reserved", "time": time.time(), "signature": signature,
+                               "pool": pool, "kind": "quota"})
+                sent.add((aid, signature))
+                resumed[pool] = resumed.get(pool, 0) + 1
+                self.cli("send", "--json", "--no-wait", "--", aid, QUOTA_PROMPT, accepted=True)
+                self.event(history, aid, "submitted", kind="quota")
+            except (ScanError, ValueError, TypeError, AttributeError) as exc:
+                self.remaining()  # Expired watch still exits at its deadline.
+                self.note(history, events, aid, "unavailable", key=f"{type(exc).__name__}:{int(time.time() // 600)}",
+                          kind="quota")
+
+    def quota_first_sight(self, history, events, waits, aid, pool, updated, signature, checked=False):
+        error_time = stamp(updated)
+        first = {"stage": "first-sight", "signature": signature, "updated_at": updated, "pool": pool}
+        if not 0 <= time.time() - error_time:
+            self.note(history, events, aid, "stale", key=signature)  # No stage: this event is never "known".
+            return
+        # The agent is still `error` (loaded) here: the only moment its timeline can be read safely, so the
+        # done:/new-instruction check is made before a wait is armed (a closed agent is never read later).
+        # `checked`: this error event was already read once (a first-sight row with the same UpdatedAt), so only
+        # aiuse is consulted again; the logs are not re-read for an agent that stays unconfirmed.
+        state = "ok" if checked else self.quota_activity(aid, pool)
+        if state != "ok":
+            self.note(history, events, aid, "delivered" if state == "delivered" else "changed", key=signature,
+                      **first)
+            return
+        account = self.aiuse_account(pool)
+        if account is None:
+            self.note(history, events, aid, "aiuse-unavailable", key=f"{signature}:{int(time.time() // 600)}",
+                      **first)
+            return
+        kind, fields = self.quota_anchor(account, error_time)
+        if kind != "wait":
+            self.note(history, events, aid, {"unconfirmed": "quota-unconfirmed", "excluded": "quota-excluded",
+                                              "stale": "stale"}[kind], key=signature, **first)
+            return
+        self.note(history, events, aid, "quota-wait", signature=signature, pool=pool, updated_at=updated,
+                  **fields)
+        waits[aid] = events[-1]
+
+    def scan(self):
+        self.state.mkdir(parents=True, exist_ok=True)
+        with (self.state / "lock").open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return 3
+            # Malformed/truncated state fails closed; never silently reset the budget.
+            path = self.state / "events.jsonl"
+            with path.open("a+", encoding="utf-8") as history:
+                history.seek(0)
+                events = [json.loads(line) for line in history if line.strip()]
+                if any(not isinstance(e, dict) or not isinstance(e.get("time"), (int, float))
+                       or not math.isfinite(e["time"]) for e in events):
+                    raise ScanError("invalid event history")
+                history.seek(0, 2)
+                lead = self.inspect(self.lead)
+                if lead.get("Archived") is not False:
+                    raise ScanError("lead is archived or unknown")
+                agents = json.loads(self.cli("ls", "-g", "--background", "--json"))
+                if not isinstance(agents, list):
+                    raise ScanError("invalid agent listing")
+                for row in agents:
+                    try:
+                        if not isinstance(row, dict):
+                            continue
+                        if row.get("status") != "error":
+                            continue
+                        aid = agent_id(row.get("id"))
+                        if self.only and aid not in self.only:
+                            continue
+                        if not self.descendant(aid):
+                            continue
+                        record = self.inspect(aid)
+                        provider = record.get("Provider", "")
+                        if record.get("Archived") is not False or record.get("Status") != "error":
+                            continue
+                        if provider not in HOSTS:
+                            continue
+                        if not self.recent_error(record):
+                            self.event(history, aid, "stale")
+                            continue
+                        logs = self.cli("logs", aid)
+                        if not transient(provider, logs):
+                            continue
+                        if self.delivered(aid, provider):
+                            self.event(history, aid, "delivered")
+                            continue
+                        signature = self.signature(record, logs, provider)
+                        attempts = [e for e in events if e.get("agent") == aid and e.get("action") == "reserved"]
+                        if (sum(e["time"] > time.time() - 3600 for e in attempts) >= 2
+                                or any(e.get("signature") == signature for e in attempts)):
+                            self.event(history, aid, "capped")
+                            continue
+                        if not (self.healthy("https://api.github.com/") and self.healthy(HOSTS[provider])):
+                            self.event(history, aid, "offline")
+                            continue
+                        if not self.apply:
+                            self.event(history, aid, "would-resume", signature=signature)
+                            continue
+                        # Probe may take seconds: re-read mutable state and ancestry before sending.
+                        fresh = self.inspect(aid)
+                        if (fresh.get("Status") != "error" or fresh.get("Archived") is not False
+                                or fresh.get("Provider") != provider or not self.descendant(aid)
+                                or not self.recent_error(fresh) or self.delivered(aid, provider)
+                                or self.signature(fresh, self.cli("logs", aid), provider) != signature):
+                            self.event(history, aid, "changed")
+                            continue
+                        # Reserve durably BEFORE the outward action. An uncertain send is never retried.
+                        if self.remaining() < CLI_TIMEOUT + RESERVE_MARGIN:
+                            self.event(history, aid, "deadline-before-reserve")
+                            return 0
+                        self.event(history, aid, "reserved", signature=signature)
+                        events.append({"agent": aid, "action": "reserved", "time": time.time(), "signature": signature})
+                        self.cli("send", "--json", "--no-wait", "--", aid, PROMPT, accepted=True)
+                        self.event(history, aid, "submitted")
+                    except (ScanError, ValueError, TypeError, AttributeError):
+                        self.remaining()  # Expired watch still exits at its deadline.
+                        self.event(history, row.get("id") if isinstance(row, dict) else None, "unavailable")
+                if self.quota:
+                    self.quota_scan(agents, history, events)
+
+        return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--lead", required=True, help="full UUID; only descendants are eligible")
+    parser.add_argument("--apply", action="store_true", help="send the fixed continuation prompt")
+    parser.add_argument("--state-dir", type=Path, default=Path.home()/".local/state/ade/net-resume",
+                        help="shared cap ledger and lock; use the same directory for every invocation")
+    parser.add_argument("--watch", type=float, metavar="SECONDS", help="watch for 1..3600 seconds")
+    parser.add_argument("--interval", type=float, default=30, help="watch interval, 5..300 seconds")
+    parser.add_argument("--max-error-age-minutes", type=float, default=30, metavar="MINUTES",
+                        help="only consider errors this recent (default 30; positive, finite)")
+    parser.add_argument("--quota", action="store_true",
+                        help="also resume Pi agents stopped by a provider quota window after aiuse shows it reset")
+    parser.add_argument("--quota-per-pool", type=int, default=1, metavar="N",
+                        help="at most N quota resumes per pool per scan (default 1); dry-run counting only, "
+                             "the 600 s pool gap limits --apply")
+    parser.add_argument("--quota-grace-seconds", type=float, default=60, metavar="SECONDS",
+                        help="wait this long past a window's reset before resuming (default 60)")
+    parser.add_argument("--only-agent", action="append", default=[], metavar="UUID",
+                        help="restrict both passes to this full agent UUID (repeatable)")
+    args = parser.parse_args(argv)
+    if args.quota_per_pool < 1:
+        parser.error("quota-per-pool must be at least 1")
+    if not math.isfinite(args.quota_grace_seconds) or args.quota_grace_seconds < 0:
+        parser.error("quota-grace-seconds must be non-negative and finite")
+    if not math.isfinite(args.max_error_age_minutes * 60) or args.max_error_age_minutes <= 0:
+        parser.error("max-error-age-minutes must be positive and finite")
+    if not math.isfinite(args.interval) or not 5 <= args.interval <= 300:
+        parser.error("interval must be 5..300 seconds")
+    if args.watch is not None and (not math.isfinite(args.watch) or not 1 <= args.watch <= 3600):
+        parser.error("watch must be 1..3600 seconds")
+    try:
+        scanner = Scanner(args.lead, args.state_dir, args.apply, args.watch or 120, args.max_error_age_minutes,
+                          args.quota, args.only_agent, args.quota_per_pool, args.quota_grace_seconds)
+        while True:
+            rc = scanner.scan()
+            if not args.watch:
+                return rc
+            if rc not in (0, 3):
+                return rc
+            delay = min(args.interval, scanner.remaining())
+            time.sleep(delay)
+    except ScanError as exc:
+        if str(exc) == "scan deadline reached" and args.watch:
+            return 0
+        print(f"ade-net-resume: {exc}", file=sys.stderr)
+        return 2
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        print(f"ade-net-resume: unreadable state or response ({type(exc).__name__})", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,282 @@
+# MCP servers on this machine (Claude Code)
+
+Snapshot **2026-08-23**. Probes beat memory: re-check with `claude mcp list`
+(spawns each server and health-checks it, ~10s). Config lives in two places:
+user-level servers in `~/.claude.json` (`mcpServers`), per-repo servers in the
+repo's `.mcp.json`.
+
+## Roster
+
+Since 2026-10-10, 12 servers (ghost-os, cua-driver, paper-search and 9
+claude.ai connectors) are blocked in Claude Code through `deniedMcpServers` in
+`~/.claude/settings.json`; [history/disabled-skills.md](history/disabled-skills.md) lists them,
+why, and how to re-enable. This table is otherwise the 2026-08-23 snapshot.
+
+| Server | Transport / command | Scope | What it is |
+|---|---|---|---|
+| `hermes` | stdio: `hermes mcp serve` | user | The **Hermes Agent** as an MCP server — see below |
+| `beeper` | HTTP: `http://127.0.0.1:23373/v0/mcp` | user | Beeper Desktop's local API — cross-network chat search/read/send. OAuth-gated; see below. Re-enabled in Claude Code 2026-10-16 (was blocked 2026-10-10) |
+| `graft` | stdio: `graft mcp` | **removed 2026-10-18** from every TUI (this repo's `.mcp.json` still lists it, neutralised by `disabledMcpjsonServers`) | Repo context graph. Deregistered from every agent TUI on 2026-10-18 (95 MCP calls vs ~24,000 CLI uses in 14 days; a stdio process per session); use the `graft` CLI. Claude Code also lists `graft` and `token-savior` under `disabledMcpjsonServers` in `~/.claude/settings.local.json`, so a stray project `.mcp.json` cannot bring it back. graft 0.23.0's SessionStart reconcile re-added the user-scope entry after the 2026-10-16 upgrade; removed again 2026-10-20 (`claude mcp remove graft -s user`), and the Hermes watchdog `check-graft-wiring-invariants.sh` now fails when any TUI registers it (94e8d95) |
+| `ghost-os` | stdio: `/opt/homebrew/bin/ghost mcp` | user | macOS UI automation via accessibility tree + vision. **Blocked in Claude Code since 2026-10-10** (`deniedMcpServers`) |
+| `hindsight` | stdio: `node ~/.hindsight/coding-agents/dist/mcp-server.js` | user | Per-repo Hindsight coding-agent memory (the 🧠 banner) |
+| `hindsight-shared` | HTTP: `http://127.0.0.1:8888/mcp/hermes-shared/` | user | Shared Hindsight bank (`hermes-shared` in the URL is the bank name) |
+| `firecrawl` | HTTP: `http://127.0.0.1:18804/mcp` (LaunchAgent `com.djbclark.firecrawl-mcp`, machine-side) | Claude Code, Codex (Pi sole-TUI 2026-11-09: opencode registration dropped; Pi is not a separate MCP client here) | Scrape, search, crawl, map on self-hosted Firecrawl (SIPB Hyades), through this repo's `bin/firecrawl-router` (kept by the operator's ruling of 2026-11-07, after the slim-down first deleted it): it proxies the MCP to Hyades, answers `query`/`json` with SIPB LLMs then LiteLLM, answers developer search from GitHub, and serves Hermes' search backend on 18805. The `firecrawl` skill lives in site-djbclark. |
+| `basic-memory` | HTTP: `http://127.0.0.1:18796/mcp` (one shared server; no per-client stdio) | Claude Code, Codex, Cursor, Hermes | Basic Memory notes (default project `main`); registered per client like `firecrawl` |
+| claude.ai Gmail / Google Calendar / Google Drive | HTTPS (Google-hosted) | claude.ai account | Remote connectors managed on claude.ai, not in local config |
+
+**TUI wiring doctor (2026-11-13).** `ade-install doctor` / `just install-doctor` prints one `tui/<id>` summary row per current TUI (the `targets` table of [bin/skill-everywhere](../bin/skill-everywhere) is the one roster: claude, codex, pi, hermes, cursor-agent, grokbot), then detail rows. MCP: each server in [config/mcp-clients.toml](../config/mcp-clients.toml) (the machine-readable mirror of the Roster table's Scope column; a test keeps them in step) x each client it lists is `ok` or a `warn` (`missing`, `wrong-url`, `wrong-type`, `disabled`) with the exact fix, read from `~/.claude.json` (user-scope `mcpServers`), `~/.codex/config.toml`, `~/.cursor/mcp.json` or `~/.hermes/config.yaml` (key names and URLs only; Pi and Grok Bot have no readable config and report `unknown`). Skills: `skill-everywhere --check --all` states become ok / missing / dangling / points elsewhere, with `bin/skill-everywhere --all` as the fix. Gaps are advisory (exit 0); only an unreadable roster or client config (or a roster without `skill-everywhere`, or the reverse) fails the run; no client config is ever edited and no fix is ever run (the one subprocess is the read-only `skill-everywhere --check --all`, which may render a temporary Grok Bot copy under `$TMPDIR`).
+
+## Firecrawl developer search (2026-10-24)
+
+The stock Firecrawl API mounts `/v2/search/developer` only when `RESEARCH_PROXY_URL` is set and then forwards to Firecrawl's
+closed index; without it the tool returned "Request failed with status code 404" (and `firecrawl_search` with
+`categories: ["developer"]` an empty list). With the commercial index off, the `djbclark-fc-api` microVM now has
+`RESEARCH_PROXY_URL=http://127.0.0.1:3010`, a `devsearch` process in the `djbclark-fc-searxng` microVM (the account is at its
+10-microVM quota) that answers from the GitHub search API: public repositories only, a fine-grained
+public-repositories-read-only token (`FIRECRAWL_GITHUB_PUBLIC_TOKEN`, set as a microVM env by `./deploy apply searxng`
+from sudo-secretspec), GitHub traffic through the same two proxy legs as SearXNG (vps-primary and pastebin.xvm.mit.edu, both
+allowing `api.github.com`), a 10-minute cache and stale-if-error. Design, knobs, failure modes and operations:
+firecrawl-hyades `docs/developer-search.md`. The Mac router answered this route itself from 2026-10-24 (PRs 41, 43, 45)
+until this cutover and no longer holds a GitHub token. Considered and not built: Exa and Parallel as extra sources; Firecrawl's
+keyless hosted developer index (the commercial API, off by djbclark's ruling of 2026-10-18); free-tier hosts (Cloud Run, Fly,
+Koyeb) for the microVMs: only Playwright and devsearch fit them, and each needs cross-provider networking.
+
+## Firecrawl search warnings that are harmless (2026-11-13)
+
+1. `firecrawl_search` answers `"warning":"Some tool discovery results are unavailable."` with `"tools":[]`. It comes from
+   the stock API in the `djbclark-fc-api` microVM (`ghcr.io/firecrawl/firecrawl:2.11.519`): every `/v2/search` also runs
+   Firecrawl's Alexandria data-provider discovery (firecrawl/firecrawl PRs 5231 and 5546), which needs Firecrawl's hosted
+   catalogue; the self-hosted node cannot reach it, so the leg fails (retried once) and the warning is added while the web results
+   are unaffected (router log: `POST /v2/search -> primary 200 3.0s`). It is not a router fault and nothing we use is degraded
+   (`firecrawl_find_tools` and `alexandria` scrapes are unavailable on this deployment, as they were).
+2. `Unsupported protocol version: 2026-07-28` in `firecrawl-mcp.log`: a client probing a newer MCP protocol version than the
+   firecrawl-mcp server accepts; the client falls back and the call succeeds.
+
+## Hermes (added 2026-08-23)
+
+`hermes` (`~/.local/bin/hermes`) is the **Hermes Agent** — Nous Research's
+agent CLI, git-installed at `~/.hermes/hermes-agent` (v0.20.5 at snapshot
+time; `hermes --version`). It is also a Paseo provider
+([model-routing.md](model-routing.md)), and clinepass is its inference
+lifeline — the MCP surface below is separate from routing *to* hermes as a
+worker.
+
+Registered so every Claude Code session on the machine gets it:
+
+```bash
+claude mcp add --scope user hermes -- hermes mcp serve
+```
+
+"Always running" needs no daemon or launchd: stdio MCP servers are spawned by
+Claude Code per session and die with it. Two gotchas verified live:
+
+- Startup takes ~10s before `tools/list` answers (well inside Claude Code's
+  timeout, but a too-short manual probe sees zero tools).
+- `hermes mcp serve` takes no port/transport flags — stdio only.
+
+Its 10 tools bridge Hermes's messaging gateway and approval queue:
+`conversations_list/get`, `messages_read`, `messages_send`,
+`attachments_fetch`, `events_poll`, `events_wait`, `channels_list`,
+`permissions_list_open`, `permissions_respond` — i.e. Claude can read/send
+through Hermes's connected platforms and answer Hermes's pending
+exec/plugin approval prompts.
+
+## Beeper (re-authed 2026-08-23)
+
+Beeper Desktop serves MCP locally on port 23373. Until authorized, the server
+exposes only an `authenticate` tool and `claude mcp list` shows
+"! Needs authentication". The fix, run from any session:
+
+1. Call the `authenticate` MCP tool → it returns a local OAuth URL
+   (`127.0.0.1:23373/oauth/authorize?...`, redirect to
+   `localhost:3118/callback`).
+2. `open "<url>"` — approve in the browser/Beeper Desktop. The callback is
+   local, so it completes itself; `complete_authentication` (paste-the-URL
+   fallback) is only for remote sessions where the callback can't land.
+3. The real tools (`search`, `search_chats`, `search_messages`,
+   `list_messages`, `send_message`, `get_accounts`, reminders, archive,
+   `focus_app`, `search_docs`) appear **mid-session** — no restart needed.
+
+Verified via `get_accounts`: 11 networks bridged (Beeper/Matrix, Discord,
+Facebook, Google Messages, Google Chat, Instagram, LinkedIn, Signal, Slack,
+Telegram, WhatsApp).
+
+### The reverse direction: Hermes → Claude already exists (don't add MCP for it)
+
+Hermes reaching Claude needs no new wiring — it already carries a full
+delegation stack (verified live 2026-08-23):
+
+- `delegate_task` + the `intelligent-delegation` Hermes skill route
+  token-heavy research/reasoning to Claude Code with leaf-role recursion
+  prevention and ≤8k-token context injection.
+- The `headless-agent-orchestration` Hermes skill defines a complete Claude
+  worker protocol on `claude-sub` (`~/.local/bin/claude-sub` — refuses
+  API-key billing, verifies claude.ai OAuth; `--check` passes) and
+  `agent-coord run` (workspace claims, stdin prompts, stream-json
+  supervision, `--resume` on max-turns). Smoke-tested end-to-end:
+  `claude-sub "<prompt>" -p --model haiku` → correct reply, ~39s
+  (mostly CLI startup).
+
+So the two agents are bidirectional: **Hermes → Claude** via headless
+delegation, **Claude → Hermes** via the MCP bridge above (including
+`permissions_respond` — Claude can answer Hermes's approval queue — and
+`events_wait` for long-poll coordination).
+
+### Keeping Hermes current — fixed 2026-08-23, was silently broken
+
+Hermes's external memory provider is Hindsight (`provider: hindsight` in
+`~/.hermes/config.yaml`), and it is now genuinely automatic: retain a fact to
+`hermes-shared` and Hermes finds it. That was **not** true earlier the same
+day, and the failure was invisible.
+
+**The bug.** The provider's own config lives at
+`~/.hermes/hindsight/config.json` — separate from `config.yaml` — and read:
+
+```json
+"bank_id": "hermes",
+"bank_id_template": "hermes-{profile}-{workspace}"
+```
+
+The template wins, so Hermes was reading a per-workspace bank
+(`hermes-default-hermes`), never `hermes-shared`. Facts retained to the
+shared bank were committed and recallable through the API, yet Hermes
+answered "not in memory" — and when asked about `cow`, confidently described
+**`cowsay`** instead. That is the failure mode to watch for: not an error,
+just a confident wrong answer sourced from general knowledge.
+
+**The fix**: point both keys at the shared bank (backup at
+`config.json.bak-2026-08-23`):
+
+```json
+"bank_id": "hermes-shared",
+"bank_id_template": "hermes-shared"
+```
+
+`auto_recall` was already `true`, so no restart or further wiring was needed.
+Verified: Hermes's own recall now returns the CoW benchmark, the cow install
+gotcha, the migration numbers, and the full S1 backfill figures.
+
+**Consequence to know about:** during the bank restructure earlier that day,
+`hermes-default-hermes` was deleted as an apparently-dead stray bank. It was
+in fact Hermes's live bank under the old template — 1 document, 5 facts,
+which is small only because `auto_retain` is `false`. Deleting it was a
+mistake; the lesson is that a bank matching an agent's `bank_id_template` is
+never "stray", and provider config must be read before any bank cleanup.
+
+**Practice:** retain cross-project facts to `hermes-shared` and Hermes gets
+them. For things Hermes must know even if recall misses — policy, standing
+rules — also append a `§` block to `~/.hermes/memories/MEMORY.md`, which is
+injected directly rather than retrieved. Per-repo banks
+(`coding-agent::<repo>`) remain invisible to Hermes by design.
+
+Hermes was **taught all of this** on 2026-08-23, in three layers: a new
+local Hermes skill `autonomous-ai-agents/claude-collaboration` (vendored
+copy: [vendor/hermes/claude-collaboration.SKILL.md](../vendor/hermes/claude-collaboration.SKILL.md))
+that tells Hermes to proactively *offer* Claude delegation when it detects a
+task is hard for it (deep reasoning, subtle debugging, judgment — once per
+task, quota-aware, without overriding its no-bulk-farming rule); a `§` block
+in its built-in `~/.hermes/memories/MEMORY.md`; and a retained memory in the
+shared Hindsight bank (`hermes-shared`), which is Hermes's active external
+memory provider — that shared bank is the durable Claude↔Hermes fact channel. Deliberately NOT done:
+registering `claude mcp serve` inside Hermes — it would only duplicate
+tools Hermes already has (file/bash), a live probe showed it idling in
+nested contexts, and Hermes's own skills forbid recursive coordinator
+loops.
+
+### Messaging: use Hermes (operator decision, 2026-08-23)
+
+**Default to `hermes` for operator-facing platform messaging** (Discord, Signal, …; agent-to-agent messages go by
+native `paseo send --json` with a named ack, standing order 10, never through this bridge; `skills/session-finder/relay.py`
+is a one-cycle Wave 6 shim over that path until deletion, soft deadline 2026-11-20). Beeper Desktop is often not
+running, and the operator uses it only occasionally — so it is not a
+dependable path for an agent. Reach for it only when the operator explicitly
+asks, or when you need cross-network *search* that Hermes cannot do and you
+have confirmed Beeper is up (`claude mcp list` shows it Connected, not
+"Needs authentication").
+
+Hermes covers the agent-facing cases: `messages_send` / `channels_list` to
+send, `conversations_list` / `messages_read` to read, `events_wait` to react
+to inbound traffic, and `permissions_list_open` / `permissions_respond` to
+clear its approval queue — none of which Beeper can do.
+
+Email is separate from both: local FTS5 index for search (below), claude.ai
+Gmail connector to act.
+
+### Not on the MCP bridge: the local Gmail index
+
+Hermes also built a high-speed local Gmail search (FTS5 SQLite index of the
+complete mailbox at `~/.hermes/gmail_index_v2.db`, ~100ms queries, kept fresh
+by a Hermes cron job every 5m). It is **not** exposed through `hermes mcp
+serve` — access is the plain CLI, documented in the
+gmail-search skill, `~/ops/site-public-djbclark/skills/gmail-search/SKILL.md` (moved 2026-11-06; deployed at
+`~/.claude/skills/gmail-search/`).
+
+## Graft statusline: "graft · not built" in this repo is cosmetic
+
+The statusline segment (this repo's `.claude/settings.json` →
+`.claude/helpers/graft-statusline.cjs` → `@nanonets/graft` `dist/claude/`)
+renders "◤ graft · not built · run `graft build`" whenever the stats cache
+reports 0 nodes. This repo's `graft/` cache is local and ignored, so a fresh checkout reads "not built" until `graft build`
+runs (the operator's step after the slim-down's final merge, 2026-11-07); after it, a 0-node reading is a real bug. Nothing to automate:
+in repos with a real graph, the `PostToolUse` hook already auto-syncs after
+every edit (detached `sync-run.js`, the "syncing…" state). The real fix is
+upstream (render empty ≠ missing); until then, ignore the segment here.
+`graft ask`/`graft grep` still work — they answer from `graft/INDEX.md` and
+the extract cache, not the wiring node count.
+
+
+## Hindsight is automatic in Hermes (2026-08-24)
+
+`~/.hermes/hindsight/config.json` now sets **`auto_recall: true` and
+`auto_retain: true`** against bank `hermes-shared`, retaining every 10 turns
+asynchronously. Hermes reads and writes shared memory with no manual step.
+
+**The manual review-before-promote pipeline is retired.** It was a
+propose/promote candidate ledger gated on operator review, and the ledger is
+the evidence it failed: nothing captured after **2026-08-11**, with two
+candidates sitting `pending` for 13 days (both rescued into `hermes-shared`
+before removal). A review gate whose reviewer does not review is a queue that
+never drains — the same objection that ruled out Link.
+
+Removed: the `Hindsight retention 30-day promotion gate` and
+`Hindsight pilot inactivity nudge` cron jobs, the `hindsight-retention-pilot`
+Hermes plugin, and its skill. `~/.hindsight/bin/hindsight_memory_z.py` (the
+`/z` propose/promote CLI) is now redundant and left in place, unused. The
+`candidates` table stays in `candidates.sqlite3` — it is Phase A history, and
+that database is also S1's home, so it must not be dropped.
+
+**One hazard found while removing this.** The
+`Hindsight shared-bank policy watchdog` did not merely alert on mission
+drift — it **overwrote** the bank mission with a hardcoded string via
+`hindsight bank update`. It ran after the mission was deliberately rewritten
+earlier the same day and silently reverted it; the change was only noticed
+because a later read showed the old text. Job and script retired, mission
+restored. The general lesson: a watchdog that auto-corrects instead of
+reporting will fight intentional change and lose work quietly.
+
+## SiYuan (added 2026-10-12)
+
+SiYuan 3.8.6 serves MCP from its own kernel: `http://127.0.0.1:6806/mcp`
+(streamable HTTP, JSON replies, 30 tools such as `notebook`, `document`,
+`block`, `search`, `sql`, `tag`, `ref`, `file`, `http_request`). There is no
+separate process, so nothing to launch and nothing for `roles/shared_mcp` to
+share: it is already one server inside the app, and it exists only while
+SiYuan runs (a closed app shows as failed in `claude mcp list`). `accessAuthCode`
+is empty and `networkServe` is false, so it is loopback-only and open to any
+local process.
+
+Registered in Claude Code (`claude mcp add --scope user --transport http siyuan
+http://127.0.0.1:6806/mcp`; backup `~/.claude.json.bak-2026-10-12-siyuan`) and
+in Hermes (`mcp_servers.siyuan` in `~/.hermes/config.yaml`). Hermes excludes
+`file`, `http_request`, `web_fetch`, `web_search` and `unzip` (`tools.exclude`),
+since it is reachable from Discord and has its own web tools. Not a proxy
+candidate: a Caddy bearer gate (as on 18797) only matters if it were ever
+exposed through the funnel, which its `file` and `http_request` tools rule out.
+
+**Checking Hermes (learned 2026-10-12).** The running gateway hot-reloads
+`mcp_servers`: `rg siyuan ~/.hermes/logs/gateway.log` shows
+`MCP servers reconciled with config: added=['siyuan']` within minutes of the edit, and
+`registered 25 tool(s)` (30 minus the 5 excluded). Do not infer this from the gateway's
+process age, and do not ask `ask_hermes`: it runs read-only, cannot run `/reload-mcp`,
+and answers from a session that started earlier. A `launchctl kickstart -k
+gui/$(id -u)/com.stayturgid.hermes-gateway` restart was unnecessary here.
